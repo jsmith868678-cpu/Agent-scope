@@ -471,9 +471,180 @@ export const LEVELS: LevelDefinition[] = [
     },
   },
   {
-    id: 'sandbox',
+    id: 'level-5',
     index: 4,
-    name: '05. Physics Sandbox',
+    name: '05. Cascade Foundry',
+    subtitle: 'Drop the crate down the belt chute, ride the lift, and ride the thermal updraft to unlock the sky vault.',
+    hint: 'Push Crate 1 off the left foundry shelf onto the belt chute to weight Plate A. Ride Lift A or scale the east foundry decks to Switch B, ride the thermal updraft to Switch C, and extract through Gate B.',
+    width: WORLD_WIDTH,
+    height: WORLD_HEIGHT,
+    spawns: [
+      { x: 56, y: 430 },
+      { x: 100, y: 430 },
+      { x: 144, y: 430 },
+      { x: 188, y: 430 },
+    ],
+    platforms: [
+      { id: 'floor-main', x: 0, y: 492, w: 960, h: 48, kind: 'solid' },
+      { id: 'wall-left', x: 0, y: 0, w: 24, h: 540, kind: 'solid' },
+      { id: 'wall-right', x: 936, y: 0, w: 24, h: 540, kind: 'solid' },
+      { id: 'ceil-top', x: 0, y: 0, w: 960, h: 24, kind: 'solid' },
+
+      // Left foundry crate shelf & staging step: crate cascades down onto the belt chute
+      { id: 'l5-step-1', x: 206, y: 432, w: 94, h: 18, kind: 'solid' },
+      { id: 'l5-crate-shelf', x: 24, y: 368, w: 168, h: 20, kind: 'solid' },
+      {
+        id: 'l5-belt-chute',
+        x: 196,
+        y: 484,
+        w: 116,
+        h: 8,
+        kind: 'solid',
+        material: 'conveyor',
+        conveyorSpeed: 145,
+      },
+      // Low foundry catch-stop curb right of Plate A so fast crates settle cleanly on the plate
+      { id: 'l5-plate-curb', x: 404, y: 460, w: 16, h: 32, kind: 'solid' },
+
+      // Channel A wall divider above Gate A
+      { id: 'l5-wall-a', x: 438, y: 24, w: 22, h: 356, kind: 'solid' },
+
+      // Channel A vertical foundry lift rising over the plasma channel
+      {
+        id: 'l5-lift',
+        x: 464,
+        y: 446,
+        w: 86,
+        h: 18,
+        kind: 'moving',
+        startPos: { x: 464, y: 446 },
+        endPos: { x: 464, y: 266 },
+        speed: 0.62,
+        channel: 'A',
+        loopWhenActive: true,
+      },
+
+      // East foundry stepped climb to Switch B + bouncy launch pad up open shaft to upper tier
+      { id: 'l5-low-step', x: 584, y: 432, w: 112, h: 18, kind: 'solid' },
+      { id: 'l5-mid-pad', x: 706, y: 372, w: 68, h: 14, kind: 'solid', material: 'bouncy', bounceVelocity: 660 },
+      { id: 'l5-mid-right', x: 782, y: 372, w: 154, h: 20, kind: 'solid' },
+
+      // Upper conveyor catwalk fed by Lift A (stops at x=696 so x=696..782 is an open launch shaft)
+      {
+        id: 'l5-upper-conveyor',
+        x: 556,
+        y: 266,
+        w: 140,
+        h: 18,
+        kind: 'solid',
+        material: 'conveyor',
+        conveyorSpeed: 105,
+      },
+
+      // Sky catwalk housing Switch C, reached via upper thermal updraft (40px drop shaft beside Gate B)
+      { id: 'l5-sky-deck', x: 636, y: 154, w: 106, h: 18, kind: 'solid' },
+
+      // Vault exit deck & upper divider wall above Gate B
+      { id: 'l5-exit-deck', x: 782, y: 266, w: 154, h: 22, kind: 'solid' },
+      { id: 'l5-wall-b', x: 782, y: 24, w: 22, h: 130, kind: 'solid' },
+    ],
+    plates: [
+      {
+        id: 'plate-a',
+        label: 'Plate A',
+        x: 322,
+        y: 480,
+        w: 80,
+        h: 12,
+        channel: 'A',
+        mode: 'momentary',
+      },
+    ],
+    switches: [
+      {
+        id: 'switch-b',
+        label: 'Switch B',
+        x: 874,
+        y: 336,
+        w: 28,
+        h: 36,
+        channel: 'B',
+        initialActive: false,
+      },
+      {
+        id: 'switch-c',
+        label: 'Switch C',
+        x: 674,
+        y: 118,
+        w: 28,
+        h: 36,
+        channel: 'C',
+        initialActive: false,
+      },
+    ],
+    doors: [
+      {
+        id: 'door-a',
+        label: 'Gate A',
+        x: 438,
+        y: 380,
+        w: 22,
+        h: 112,
+        channels: ['A'],
+        logic: 'ALL',
+      },
+      {
+        id: 'door-b',
+        label: 'Gate B',
+        x: 782,
+        y: 154,
+        w: 22,
+        h: 112,
+        channels: ['B', 'C'],
+        logic: 'ALL',
+      },
+    ],
+    crates: [
+      {
+        id: 'crate-1',
+        label: 'Crate 1',
+        x: 86,
+        y: 338,
+        w: 30,
+        h: 30,
+        shape: 'box',
+        material: 'wood',
+        mass: 1.2,
+      },
+    ],
+    hazards: [
+      { id: 'hazard-l5', x: 468, y: 482, w: 78, h: 10, kind: 'plasma' },
+    ],
+    forceZones: [
+      {
+        id: 'fz-l5-updraft',
+        label: 'Thermal Updraft',
+        x: 548,
+        y: 92,
+        w: 54,
+        h: 174,
+        fx: 0,
+        fy: -2100,
+      },
+    ],
+    exit: {
+      id: 'exit-5',
+      x: 840,
+      y: 202,
+      w: 76,
+      h: 64,
+      requiredChannels: ['A', 'B', 'C'],
+    },
+  },
+  {
+    id: 'sandbox',
+    index: 5,
+    name: '06. Physics Sandbox',
     subtitle: 'Experiment with gravity, elastic collisions, ice, bounce pads, and wind tunnels.',
     hint: 'Use the Sandbox tab to spawn crates, kinetic spheres, ice strips, bounce pads, or updrafts, fling bodies with your cursor, or tune gravity & restitution in real time.',
     isSandbox: true,

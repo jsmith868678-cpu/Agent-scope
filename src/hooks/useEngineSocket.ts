@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   ActorInput,
   ActorRole,
+  AgentMessageKind,
   ClientWsMessage,
   PhysicsConfig,
   SandboxAction,
@@ -24,6 +25,7 @@ export interface EngineConnectionState {
     value?: number | string | boolean | Partial<PhysicsConfig>
   ) => void;
   sendSandbox: (payload: SandboxAction) => void;
+  sendMessage: (actorId: string | null | undefined, text: string, kind?: AgentMessageKind) => void;
 }
 
 export function useEngineSocket(): EngineConnectionState {
@@ -48,7 +50,8 @@ export function useEngineSocket(): EngineConnectionState {
   const applyWorldFrame = useCallback((nextWorld: WorldState, forceSync = false) => {
     worldRef.current = nextWorld;
     const doorSig = nextWorld.doors.map((d) => (d.open ? '1' : '0')).join('');
-    const discreteSig = `${nextWorld.levelId}|${nextWorld.tick === 0 ? 0 : 1}|${nextWorld.paused}|${nextWorld.solved}|${nextWorld.solvedAtTick ?? ''}|${nextWorld.channels.A ? 1 : 0}${nextWorld.channels.B ? 1 : 0}${nextWorld.channels.C ? 1 : 0}|${doorSig}|${nextWorld.actors.length}|${nextWorld.crates.length}|${nextWorld.platforms.length}|${nextWorld.forceZones?.length ?? 0}|${nextWorld.physics?.gravity ?? 0}|${nextWorld.physics?.restitution ?? 0}|${nextWorld.physics?.surfaceFriction ?? 0}|${nextWorld.timeScale}|${nextWorld.events.length}`;
+    const lastMsgId = nextWorld.messages?.[nextWorld.messages.length - 1]?.id ?? '';
+    const discreteSig = `${nextWorld.levelId}|${nextWorld.tick === 0 ? 0 : 1}|${nextWorld.paused}|${nextWorld.solved}|${nextWorld.solvedAtTick ?? ''}|${nextWorld.channels.A ? 1 : 0}${nextWorld.channels.B ? 1 : 0}${nextWorld.channels.C ? 1 : 0}|${doorSig}|${nextWorld.actors.length}|${nextWorld.crates.length}|${nextWorld.platforms.length}|${nextWorld.forceZones?.length ?? 0}|${nextWorld.physics?.gravity ?? 0}|${nextWorld.physics?.restitution ?? 0}|${nextWorld.physics?.surfaceFriction ?? 0}|${nextWorld.timeScale}|${nextWorld.events.length}|${nextWorld.messages?.length ?? 0}:${lastMsgId}`;
     const now = performance.now();
     if (
       forceSync ||
@@ -166,6 +169,15 @@ export function useEngineSocket(): EngineConnectionState {
     [sendRaw]
   );
 
+  const sendMessage = useCallback(
+    (actorId: string | null | undefined, text: string, kind?: AgentMessageKind) => {
+      const clean = text.trim();
+      if (!clean) return;
+      sendRaw({ type: 'message', actorId: actorId ?? undefined, text: clean, kind });
+    },
+    [sendRaw]
+  );
+
   return {
     world,
     worldRef,
@@ -178,5 +190,6 @@ export function useEngineSocket(): EngineConnectionState {
     sendInput,
     sendControl,
     sendSandbox,
+    sendMessage,
   };
 }

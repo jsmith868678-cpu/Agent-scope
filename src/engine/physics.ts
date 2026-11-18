@@ -3,6 +3,8 @@ import type {
   ActorInput,
   ActorRole,
   ActorState,
+  AgentMessage,
+  AgentMessageKind,
   AgentObservation,
   ChannelId,
   CrateState,
@@ -58,6 +60,7 @@ const MATERIAL_DEFAULTS: Record<
 
 let eventSeq = 0;
 let sandboxSeq = 0;
+let messageSeq = 0;
 
 function makeEvent(
   tick: number,
@@ -162,6 +165,12 @@ export function createActor(
     decisionsCount: 0,
     squashX: 1,
     squashY: 1,
+    knockbackVx: 0,
+    knockbackTimer: 0,
+    lastJumpTick: 0,
+    standingOnActorId: null,
+    supportingActorId: null,
+    stackKind: null,
   };
 }
 
@@ -250,6 +259,7 @@ export function createWorld(
       linkedIds: level.exit.linkedIds ? [...level.exit.linkedIds] : [],
       logic: level.exit.logic ?? 'ALL',
     },
+    messages: [],
     events: [makeEvent(0, 'level:loaded', `Loaded ${level.name}`)],
     metrics: {
       totalTicks: 0,
@@ -279,6 +289,7 @@ export function softResetWorld(world: WorldState, level: LevelDefinition): void 
   world.solvedAtTick = null;
   world.solvedAtSeconds = null;
   world.recentImpulses = [];
+  world.messages = [];
 
   for (const plat of world.platforms) {
     plat.progress = 0;
@@ -407,6 +418,80 @@ function pushWorldEvent(world: WorldState, ev: TelemetryEvent): void {
   if (world.events.length > 80) {
     world.events.splice(0, world.events.length - 80);
   }
+}
+
+export function recordAgentMessage(
+  world: WorldState,
+  actorId: string,
+  text: string,
+  opts?: {
+    kind?: AgentMessageKind;
+    targetId?: string;
+    channel?: ChannelId;
+  },
+  outEvents?: TelemetryEvent[]
+): AgentMessage | null {
+  const actor = world.actors.find((a) => a.id === actorId);
+  if (!actor) return null;
+  const cleanText = text.trim().replace(/\s+/g, ' ').slice(0, 220);
+  if (!cleanText) return null;
+
+  const kind: AgentMessageKind = opts?.kind ?? 'status';
+  const targetId = opts?.targetId;
+
+  // Deduplicate identical messages from the same actor within 120 ticks (~2s)
+  for (let i = world.messages.length - 1; i >= 0; i--) {
+    const prev = world.messages[i];
+    if (prev.actorId === actorId) {
+      if (
+        prev.text === cleanText &&
+        prev.kind === kind &&
+        prev.targetId === targetId &&
+        world.tick - prev.tick < 120
+      ) {
+        return null;
+      }
+      break;
+    }
+  }
+
+  messageSeq += 1;
+  const msg: AgentMessage = {
+    id: `msg-${world.tick}-${messageSeq}`,
+    tick: world.tick,
+    timestamp: Date.now(),
+    actorId: actor.id,
+    actorLabel: actor.label,
+    actorName: actor.name,
+    actorColor: actor.color,
+    text: cleanText,
+    kind,
+    targetId,
+    channel: opts?.channel,
+  };
+  world.messages.push(msg);
+  if (world.messages.length > 24) {
+    world.messages.splice(0, world.messages.length - 24);
+  }
+
+  actor.lastInput = {
+    ...actor.lastInput,
+    message: cleanText,
+    messageKind: kind,
+    messageChannel: opts?.channel,
+    ...(kind === 'claim' && targetId ? { claimTargetId: targetId } : {}),
+  };
+
+  const ev = makeEvent(
+    world.tick,
+    'agent:message',
+    `${actor.label} [${kind}]: ${cleanText}`,
+    actor.id,
+    targetId
+  );
+  pushWorldEvent(world, ev);
+  if (outEvents) outEvents.push(ev);
+  return msg;
 }
 
 export function updateWorldPhysics(
@@ -1410,6 +1495,56 @@ function getSolidObstacles(world: WorldState): Array<Rect & { material: Platform
   return solids;
 }
 
+function resolveCrateStaticClearance(
+  crate: CrateState,
+  staticSolids: ReturnType<typeof getSolidObstacles>,
+  world: WorldState
+): void {
+  crate.x = clamp(crate.x, 26, world.width - 26 - crate.w);
+  crate.y = clamp(crate.y, 26, world.height - 48 - crate.h);
+  for (const solid of staticSolids) {
+    if (rectsOverlap(crate, solid)) {
+      const overlapLeft = crate.x + crate.w - solid.x;
+      const overlapRight = solid.x + solid.w - crate.x;
+      const overlapTop = crate.y + crate.h - solid.y;
+      const overlapBottom = solid.y + solid.h - crate.y;
+      const minX = Math.min(overlapLeft, overlapRight);
+      const minY = Math.min(overlapTop, overlapBottom);
+      if (minX <= minY) {
+        if (overlapLeft <= overlapRight) {
+          crate.x = Math.max(26, solid.x - crate.w);
+        } else {
+          crate.x = Math.min(world.width - 26 - crate.w, solid.x + solid.w);
+        }
+      } else if (overlapBottom <= overlapTop && solid.id !== 'floor-main') {
+        crate.y = Math.min(world.height - 48 - crate.h, solid.y + solid.h);
+      } else {
+        crate.y = Math.max(26, solid.y - crate.h);
+      }
+    }
+  }
+}
+
+function segmentCrossesSolid(
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+  solids: ReturnType<typeof getSolidObstacles>
+): boolean {
+  // Sample the reach line; skip the endpoints so the actor/crate may graze a surface.
+  for (let t = 0.16; t <= 0.84; t += 0.085) {
+    const px = ax + (bx - ax) * t;
+    const py = ay + (by - ay) * t;
+    for (const solid of solids) {
+      if (px > solid.x + 1 && px < solid.x + solid.w - 1 && py > solid.y + 1 && py < solid.y + solid.h - 1) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 function isStandingOnPlatform(entity: Rect, plat: PlatformState, prevPlatX: number, prevPlatY: number): boolean {
   const horizOverlap = entity.x + entity.w > prevPlatX + 1 && entity.x < prevPlatX + plat.w - 1;
   const bottom = entity.y + entity.h;
@@ -1565,180 +1700,196 @@ export function stepWorld(
       }
     }
 
-    // Horizontal step & static solid collisions (with elastic restitution)
+    // Velocity-adaptive sub-stepping prevents fast blasted/flung crates from tunneling through thin pads or gates
     const crateAnchor = preCarryCratePos.get(crate.id) ?? { x: crate.x, y: crate.y };
-    crate.x += crate.vx * clampedDt;
-    for (const solid of staticSolids) {
-      if (rectsOverlap(crate, solid)) {
-        const netDx = crate.x - crateAnchor.x;
-        const overlapLeft = crate.x + crate.w - solid.x;
-        const overlapRight = solid.x + solid.w - crate.x;
-        const overlapTop = crate.y + crate.h - solid.y;
-        const overlapBottom = solid.y + solid.h - crate.y;
-        const minX = Math.min(overlapLeft, overlapRight);
-        const minY = Math.min(overlapTop, overlapBottom);
-        const verticalLandingOverlap =
-          (crateAnchor.y + crate.h <= solid.y + 4 || crateAnchor.y >= solid.y + solid.h - 4) &&
-          minY < minX;
-        if (verticalLandingOverlap) continue;
+    const maxDisp = Math.max(Math.abs(crate.vx), Math.abs(crate.vy)) * clampedDt;
+    const subSteps = maxDisp > 7 ? Math.min(6, Math.ceil(maxDisp / 6)) : 1;
+    const subDt = clampedDt / subSteps;
+    let crateRespawned = false;
 
-        if (solid.id === 'wall-left') crate.x = solid.x + solid.w;
-        else if (solid.id === 'wall-right') crate.x = solid.x - crate.w;
-        else if (crate.vx > 0 || (crate.vx === 0 && netDx > 0) || crateAnchor.x + crate.w <= solid.x + 2) {
-          crate.x = solid.x - crate.w;
-        } else if (crate.vx < 0 || (crate.vx === 0 && netDx < 0) || crateAnchor.x >= solid.x + solid.w - 2) {
-          crate.x = solid.x + solid.w;
-        } else if (minX <= minY) {
-          crate.x = overlapLeft <= overlapRight ? solid.x - crate.w : solid.x + solid.w;
-        }
-        const bounce = effectiveRestitution(crate.restitution, phys.restitution);
-        if (Math.abs(crate.vx) > 65 && bounce > 0.05) {
-          crate.vx = -crate.vx * bounce;
-          world.metrics.collisionCount += 1;
-        } else {
-          crate.vx = 0;
-        }
-      }
-    }
-    crate.x = clamp(crate.x, 24, world.width - 24 - crate.w);
+    for (let stepIdx = 0; stepIdx < subSteps; stepIdx++) {
+      const stepAnchorX = stepIdx === 0 ? crateAnchor.x : crate.x;
+      const stepAnchorY = stepIdx === 0 ? crateAnchor.y : crate.y;
 
-    // Horizontal crate-vs-crate elastic momentum exchange
-    for (const other of world.crates) {
-      if (other.id === crate.id || heldCrateIds.has(other.id)) continue;
-      if (rectsOverlap(crate, other)) {
-        const overlapLeft = crate.x + crate.w - other.x;
-        const overlapRight = other.x + other.w - crate.x;
-        const overlapTop = crate.y + crate.h - other.y;
-        const overlapBottom = other.y + other.h - crate.y;
-        const minX = Math.min(overlapLeft, overlapRight);
-        const minY = Math.min(overlapTop, overlapBottom);
-        if (minX <= minY) {
-          const invM1 = 1 / crate.mass;
-          const invM2 = 1 / other.mass;
-          const invSum = invM1 + invM2;
-          if (overlapLeft < overlapRight) {
-            crate.x -= minX * (invM1 / invSum);
-            other.x += minX * (invM2 / invSum);
-          } else {
-            crate.x += minX * (invM1 / invSum);
-            other.x -= minX * (invM2 / invSum);
+      // Horizontal step & static solid collisions (with elastic restitution)
+      crate.x += crate.vx * subDt;
+      for (const solid of staticSolids) {
+        if (rectsOverlap(crate, solid)) {
+          const netDx = crate.x - stepAnchorX;
+          const overlapLeft = crate.x + crate.w - solid.x;
+          const overlapRight = solid.x + solid.w - crate.x;
+          const overlapTop = crate.y + crate.h - solid.y;
+          const overlapBottom = solid.y + solid.h - crate.y;
+          const minX = Math.min(overlapLeft, overlapRight);
+          const minY = Math.min(overlapTop, overlapBottom);
+          const verticalLandingOverlap =
+            (stepAnchorY + crate.h <= solid.y + 4 || stepAnchorY >= solid.y + solid.h - 4) &&
+            minY < minX;
+          if (verticalLandingOverlap) continue;
+
+          if (solid.id === 'wall-left') crate.x = solid.x + solid.w;
+          else if (solid.id === 'wall-right') crate.x = solid.x - crate.w;
+          else if (crate.vx > 0 || (crate.vx === 0 && netDx > 0) || stepAnchorX + crate.w <= solid.x + 2) {
+            crate.x = solid.x - crate.w;
+          } else if (crate.vx < 0 || (crate.vx === 0 && netDx < 0) || stepAnchorX >= solid.x + solid.w - 2) {
+            crate.x = solid.x + solid.w;
+          } else if (minX <= minY) {
+            crate.x = overlapLeft <= overlapRight ? solid.x - crate.w : solid.x + solid.w;
           }
-          const e = effectiveRestitution(Math.max(crate.restitution, other.restitution), phys.restitution);
-          const relVx = crate.vx - other.vx;
-          const sepDir = overlapLeft < overlapRight ? 1 : -1;
-          if (relVx * sepDir > 0) {
-            const j = (-(1 + e) * relVx) / invSum;
-            crate.vx += j * invM1;
-            other.vx -= j * invM2;
-            world.metrics.collisionCount += 1;
-          }
-        }
-      }
-    }
-
-    // Vertical step & collisions (static solids + bounce pads + crate stacking)
-    const prevCrateY = crateAnchor.y;
-    crate.y += crate.vy * clampedDt;
-    crate.grounded = false;
-
-    for (const solid of staticSolids) {
-      if (rectsOverlap(crate, solid)) {
-        const netDy = crate.y - prevCrateY;
-        const overlapTop = crate.y + crate.h - solid.y;
-        const overlapBottom = solid.y + solid.h - crate.y;
-        const cameFromAbove = prevCrateY + crate.h <= solid.y + 6;
-        const cameFromBelow = prevCrateY >= solid.y + solid.h - 6 && solid.id !== 'floor-main';
-        const shallowTop = !cameFromBelow && netDy >= 0 && crate.vy >= 0 && overlapTop <= Math.max(14, Math.abs(netDy) + 6);
-        const shallowBottom = solid.id !== 'floor-main' && (netDy < 0 || crate.vy < 0) && overlapBottom <= Math.max(14, Math.abs(netDy) + 6);
-        if (cameFromAbove || shallowTop) {
-          crate.y = solid.y - crate.h;
-          if (solid.material === 'bouncy') {
-            crate.vy = -(solid.bounceVelocity ?? 680);
-            const pad = world.platforms.find((p) => p.id === solid.id);
-            if (pad) pad.compression = 1;
-            world.metrics.collisionCount += 1;
-          } else {
-            const bounce = effectiveRestitution(crate.restitution, phys.restitution);
-            if (crate.vy > 68 && bounce > 0.08) {
-              crate.vy = -crate.vy * bounce;
-              world.metrics.collisionCount += 1;
-            } else {
-              crate.vy = 0;
-              crate.grounded = true;
-            }
-          }
-        } else if (cameFromBelow || shallowBottom) {
-          crate.y = solid.y + solid.h;
           const bounce = effectiveRestitution(crate.restitution, phys.restitution);
-          crate.vy = Math.abs(crate.vy) > 65 ? -crate.vy * bounce : 0;
+          if (Math.abs(crate.vx) > 65 && bounce > 0.05) {
+            crate.vx = -crate.vx * bounce;
+            world.metrics.collisionCount += 1;
+          } else {
+            crate.vx = 0;
+          }
         }
       }
-    }
-    if (crate.y > world.height - 48 - crate.h) {
-      crate.y = world.height - 48 - crate.h;
-      crate.vy = 0;
-      crate.grounded = true;
-    }
-    if (crate.y < 24) {
-      crate.y = 24;
-      crate.vy = Math.max(0, crate.vy);
-    }
+      crate.x = clamp(crate.x, 24, world.width - 24 - crate.w);
 
-    // Crate-on-crate vertical stacking & restitution
-    for (const other of world.crates) {
-      if (other.id === crate.id || heldCrateIds.has(other.id)) continue;
-      if (rectsOverlap(crate, other)) {
-        const prevBottom = prevCrateY + crate.h;
-        if (crate.vy >= 0 && prevBottom <= other.y + 10) {
-          crate.y = other.y - crate.h;
-          const relVy = crate.vy - other.vy;
-          const e = effectiveRestitution(Math.max(crate.restitution, other.restitution), phys.restitution);
-          if (relVy > 85 && e > 0.12) {
+      // Horizontal crate-vs-crate elastic momentum exchange
+      for (const other of world.crates) {
+        if (other.id === crate.id || heldCrateIds.has(other.id)) continue;
+        if (rectsOverlap(crate, other)) {
+          const overlapLeft = crate.x + crate.w - other.x;
+          const overlapRight = other.x + other.w - crate.x;
+          const overlapTop = crate.y + crate.h - other.y;
+          const overlapBottom = other.y + other.h - crate.y;
+          const minX = Math.min(overlapLeft, overlapRight);
+          const minY = Math.min(overlapTop, overlapBottom);
+          if (minX <= minY) {
             const invM1 = 1 / crate.mass;
             const invM2 = 1 / other.mass;
-            const j = (-(1 + e) * relVy) / (invM1 + invM2);
-            crate.vy += j * invM1;
-            other.vy -= j * invM2;
-            world.metrics.collisionCount += 1;
-          } else {
-            crate.vy = other.vy;
-            crate.grounded = true;
+            const invSum = invM1 + invM2;
+            if (overlapLeft < overlapRight) {
+              crate.x -= minX * (invM1 / invSum);
+              other.x += minX * (invM2 / invSum);
+            } else {
+              crate.x += minX * (invM1 / invSum);
+              other.x -= minX * (invM2 / invSum);
+            }
+            const e = effectiveRestitution(Math.max(crate.restitution, other.restitution), phys.restitution);
+            const relVx = crate.vx - other.vx;
+            const sepDir = overlapLeft < overlapRight ? 1 : -1;
+            if (relVx * sepDir > 0) {
+              const j = (-(1 + e) * relVx) / invSum;
+              crate.vx += j * invM1;
+              other.vx -= j * invM2;
+              world.metrics.collisionCount += 1;
+            }
           }
-        } else if (crate.vy < 0 && prevCrateY >= other.y + other.h - 10) {
-          crate.y = other.y + other.h;
-          crate.vy = 0;
         }
       }
+
+      // Vertical step & collisions (static solids + bounce pads + crate stacking)
+      const prevCrateY = stepAnchorY;
+      crate.y += crate.vy * subDt;
+      crate.grounded = false;
+
+      for (const solid of staticSolids) {
+        if (rectsOverlap(crate, solid)) {
+          const netDy = crate.y - prevCrateY;
+          const overlapTop = crate.y + crate.h - solid.y;
+          const overlapBottom = solid.y + solid.h - crate.y;
+          const cameFromAbove = prevCrateY + crate.h <= solid.y + 6;
+          const cameFromBelow = prevCrateY >= solid.y + solid.h - 6 && solid.id !== 'floor-main';
+          const shallowTop = !cameFromBelow && netDy >= 0 && crate.vy >= 0 && overlapTop <= Math.max(14, Math.abs(netDy) + 6);
+          const shallowBottom = solid.id !== 'floor-main' && (netDy < 0 || crate.vy < 0) && overlapBottom <= Math.max(14, Math.abs(netDy) + 6);
+          if (cameFromAbove || shallowTop) {
+            crate.y = solid.y - crate.h;
+            if (solid.material === 'bouncy') {
+              crate.vy = -(solid.bounceVelocity ?? 680);
+              const pad = world.platforms.find((p) => p.id === solid.id);
+              if (pad) pad.compression = 1;
+              world.metrics.collisionCount += 1;
+            } else {
+              const bounce = effectiveRestitution(crate.restitution, phys.restitution);
+              if (crate.vy > 68 && bounce > 0.08) {
+                crate.vy = -crate.vy * bounce;
+                world.metrics.collisionCount += 1;
+              } else {
+                crate.vy = 0;
+                crate.grounded = true;
+              }
+            }
+          } else if (cameFromBelow || shallowBottom) {
+            crate.y = solid.y + solid.h;
+            const bounce = effectiveRestitution(crate.restitution, phys.restitution);
+            crate.vy = Math.abs(crate.vy) > 65 ? -crate.vy * bounce : 0;
+          }
+        }
+      }
+      if (crate.y > world.height - 48 - crate.h) {
+        crate.y = world.height - 48 - crate.h;
+        crate.vy = 0;
+        crate.grounded = true;
+      }
+      if (crate.y < 24) {
+        crate.y = 24;
+        crate.vy = Math.max(0, crate.vy);
+      }
+
+      // Crate-on-crate vertical stacking & restitution
+      for (const other of world.crates) {
+        if (other.id === crate.id || heldCrateIds.has(other.id)) continue;
+        if (rectsOverlap(crate, other)) {
+          const prevBottom = prevCrateY + crate.h;
+          if (crate.vy >= 0 && prevBottom <= other.y + 10) {
+            crate.y = other.y - crate.h;
+            const relVy = crate.vy - other.vy;
+            const e = effectiveRestitution(Math.max(crate.restitution, other.restitution), phys.restitution);
+            if (relVy > 85 && e > 0.12) {
+              const invM1 = 1 / crate.mass;
+              const invM2 = 1 / other.mass;
+              const j = (-(1 + e) * relVy) / (invM1 + invM2);
+              crate.vy += j * invM1;
+              other.vy -= j * invM2;
+              world.metrics.collisionCount += 1;
+            } else {
+              crate.vy = other.vy;
+              crate.grounded = true;
+            }
+          } else if (crate.vy < 0 && prevCrateY >= other.y + other.h - 10) {
+            crate.y = other.y + other.h;
+            crate.vy = 0;
+          }
+        }
+      }
+
+      // Hazard safety respawn for crates
+      for (const haz of world.hazards) {
+        if (rectsOverlap(crate, haz)) {
+          crate.x = crate.spawnX;
+          crate.y = crate.spawnY;
+          crate.vx = 0;
+          crate.vy = 0;
+          crate.angle = 0;
+          crate.angularVel = 0;
+          crateRespawned = true;
+          break;
+        }
+      }
+      if (crateRespawned) break;
     }
 
     // Angular rotation for rolling balls & subtle tumble for airborne boxes
-    if (crate.shape === 'ball') {
-      const radius = crate.w * 0.5;
-      if (crate.grounded) {
-        crate.angularVel = crate.vx / Math.max(8, radius);
+    if (!crateRespawned) {
+      if (crate.shape === 'ball') {
+        const radius = crate.w * 0.5;
+        if (crate.grounded) {
+          crate.angularVel = crate.vx / Math.max(8, radius);
+        } else {
+          crate.angularVel *= Math.exp(-0.4 * clampedDt);
+        }
+        crate.angle += crate.angularVel * clampedDt;
       } else {
-        crate.angularVel *= Math.exp(-0.4 * clampedDt);
-      }
-      crate.angle += crate.angularVel * clampedDt;
-    } else {
-      if (!crate.grounded && Math.abs(crate.vx) > 40) {
-        crate.angularVel = clamp(crate.vx * 0.008, -2.5, 2.5);
-        crate.angle = clamp(crate.angle + crate.angularVel * clampedDt, -0.22, 0.22);
-      } else {
-        crate.angle += (0 - crate.angle) * Math.min(1, 16 * clampedDt);
-        crate.angularVel = 0;
-      }
-    }
-
-    // Hazard safety respawn for crates
-    for (const haz of world.hazards) {
-      if (rectsOverlap(crate, haz)) {
-        crate.x = crate.spawnX;
-        crate.y = crate.spawnY;
-        crate.vx = 0;
-        crate.vy = 0;
-        crate.angle = 0;
-        crate.angularVel = 0;
+        if (!crate.grounded && Math.abs(crate.vx) > 40) {
+          crate.angularVel = clamp(crate.vx * 0.008, -2.5, 2.5);
+          crate.angle = clamp(crate.angle + crate.angularVel * clampedDt, -0.22, 0.22);
+        } else {
+          crate.angle += (0 - crate.angle) * Math.min(1, 16 * clampedDt);
+          crate.angularVel = 0;
+        }
       }
     }
   }
@@ -1795,6 +1946,19 @@ export function stepWorld(
       interact: interactHeld,
       grab: grabHeld,
     };
+    if (typeof rawInput.message === 'string' && rawInput.message.trim().length > 0) {
+      recordAgentMessage(
+        world,
+        actor.id,
+        rawInput.message,
+        {
+          kind: rawInput.messageKind,
+          targetId: rawInput.claimTargetId ?? rawInput.targetId,
+          channel: rawInput.messageChannel,
+        },
+        newEvents
+      );
+    }
     actor.prevJumpHeld = jumpHeld;
     actor.prevInteractHeld = interactHeld;
     actor.prevGrabHeld = grabHeld;
@@ -1807,13 +1971,55 @@ export function stepWorld(
         const held = world.crates.find((c) => c.id === actor.holdingCrateId);
         if (held) {
           if (moveDir === 0 && actor.grounded) {
+            // Set it down just ahead of the boots, but never inside a wall. If the
+            // space ahead is blocked, fall back to the actor's feet, then behind.
+            const aheadX =
+              actor.x + actor.w * 0.5 + actor.facing * (actor.w * 0.5 + held.w * 0.5 + 3) - held.w * 0.5;
+            const centerX = actor.x + (actor.w - held.w) * 0.5;
+            const behindX =
+              actor.x + actor.w * 0.5 - actor.facing * (actor.w * 0.5 + held.w * 0.5 + 3) - held.w * 0.5;
+            const dropY = clamp(actor.y + actor.h - held.h, 26, world.height - 48 - held.h);
+            const candidates = [aheadX, centerX, behindX];
+            let chosenX = centerX;
+            let foundDrop = false;
+            const isFree = (candidateX: number) => {
+              const x = clamp(candidateX, 26, world.width - 26 - held.w);
+              const probe = { x, y: dropY, w: held.w, h: held.h };
+              return !staticSolids.some((solid) => rectsOverlap(probe, solid));
+            };
+            for (const candidateX of candidates) {
+              if (isFree(candidateX)) {
+                chosenX = candidateX;
+                foundDrop = true;
+                break;
+              }
+            }
+            // Tight corner: search outward from the feet for the nearest free patch.
+            if (!foundDrop) {
+              const baseX = clamp(centerX, 26, world.width - 26 - held.w);
+              for (let offset = 4; offset <= 120 && !foundDrop; offset += 4) {
+                for (const dir of [-1, 1]) {
+                  const candidateX = baseX + dir * offset;
+                  if (candidateX < 26 || candidateX > world.width - 26 - held.w) continue;
+                  if (isFree(candidateX)) {
+                    chosenX = candidateX;
+                    foundDrop = true;
+                    break;
+                  }
+                }
+              }
+            }
+            held.x = clamp(chosenX, 26, world.width - 26 - held.w);
+            held.y = dropY;
             held.vx = 0;
-            held.vy = 20;
+            held.vy = 0;
+            held.grounded = true;
           } else {
             held.vx = actor.vx + actor.facing * 260 * phys.pushForce / Math.sqrt(held.mass);
             held.vy = actor.vy - 170 * phys.pushForce / Math.sqrt(held.mass);
+            held.grounded = false;
           }
-          held.grounded = false;
+          resolveCrateStaticClearance(held, staticSolids, world);
         }
         actor.holdingCrateId = null;
       } else {
@@ -1822,13 +2028,19 @@ export function stepWorld(
         let nearest: CrateState | null = null;
         let bestDist = 48;
         for (const c of world.crates) {
-          const d = Math.hypot(c.x + c.w * 0.5 - acx, c.y + c.h * 0.5 - acy);
+          const ccx = c.x + c.w * 0.5;
+          const ccy = c.y + c.h * 0.5;
+          if (Math.abs(ccy - acy) > 46) continue;
+          if (segmentCrossesSolid(acx, acy, ccx, ccy, staticSolids)) continue;
+          const d = Math.hypot(ccx - acx, ccy - acy);
           if (d < bestDist) {
             bestDist = d;
             nearest = c;
           }
         }
         if (nearest) {
+          // Turn into the pick rather than grabbing through the character's back.
+          actor.facing = nearest.x + nearest.w * 0.5 >= acx ? 1 : -1;
           actor.holdingCrateId = nearest.id;
         }
       }
@@ -1881,6 +2093,7 @@ export function stepWorld(
       actor.grounded = false;
       actor.coyoteTimer = 0;
       actor.jumpBufferTimer = 0;
+      actor.lastJumpTick = world.tick;
       actor.squashX = 0.84;
       actor.squashY = 1.18;
     }
@@ -1905,6 +2118,11 @@ export function stepWorld(
     // Move horizontally & apply mass-weighted push impulse to crates
     const actorAnchor = preCarryActorPos.get(actor.id) ?? { x: actor.x, y: actor.y };
     actor.x += actor.vx * clampedDt;
+    if ((actor.knockbackTimer ?? 0) > 0) {
+      actor.x += (actor.knockbackVx ?? 0) * clampedDt;
+      actor.knockbackVx = (actor.knockbackVx ?? 0) * Math.exp(-7 * clampedDt);
+      actor.knockbackTimer = Math.max(0, (actor.knockbackTimer ?? 0) - clampedDt);
+    }
     const netActorDx = actor.x - actorAnchor.x;
     const actorPushSign = Math.sign(actor.vx) || Math.sign(netActorDx);
 
@@ -2047,18 +2265,76 @@ export function stepWorld(
       if (rectsOverlap(actor, crate)) {
         const prevBottom = prevY + actor.h;
         if (actor.vy >= 0 && prevBottom <= crate.y + 8) {
+          const impactSpeed = actor.vy;
           actor.y = crate.y - actor.h;
-          if (!wasGrounded && actor.vy > 180) {
+          if (!wasGrounded && impactSpeed > 180) {
             actor.squashX = 1.18;
             actor.squashY = 0.82;
           }
-          actor.vy = 0;
-          actor.grounded = true;
-          actor.x += crate.vx * clampedDt;
+          // Landing on a dynamic body transfers momentum instead of treating
+          // it as a static shelf. Balls roll and bounce the actor; boxes take
+          // a smaller nudge and remain stable standing surfaces.
+          let bouncedOffBall = false;
+          if (!wasGrounded && impactSpeed > 80) {
+            const actorCx = actor.x + actor.w * 0.5;
+            const crateCx = crate.x + crate.w * 0.5;
+            const dir = Math.sign(actorCx - crateCx) || Math.sign(actor.vx) || actor.facing || 1;
+            const massRatio = actor.mass / Math.max(0.3, actor.mass + crate.mass);
+            if (crate.shape === 'ball') {
+              const kick = Math.min(460, impactSpeed * 0.95) * massRatio;
+              crate.vx += dir * kick;
+              crate.angularVel = crate.vx / Math.max(10, crate.w * 0.5);
+              if (!crate.grounded) crate.vy += impactSpeed * massRatio * 0.35;
+              const bounce = Math.min(0.62, crate.restitution * 0.8);
+              if (bounce > 0.05) {
+                actor.vy = -impactSpeed * bounce;
+                actor.grounded = false;
+                bouncedOffBall = true;
+              }
+            } else {
+              crate.vx +=
+                (dir * Math.min(130, impactSpeed * 0.2) * massRatio) / Math.max(0.55, crate.mass);
+              if (!crate.grounded) crate.vy += impactSpeed * massRatio * 0.22;
+            }
+            world.metrics.collisionCount += 1;
+          }
+          if (!bouncedOffBall) {
+            actor.vy = 0;
+            actor.grounded = true;
+            // A rolling ball slips out from under the actor; boxes and
+            // platforms carry their rider because they are stable surfaces.
+            if (crate.shape !== 'ball') actor.x += crate.vx * clampedDt;
+          }
         } else if (actor.vy < 0 && prevY >= crate.y + crate.h - 8) {
           actor.y = crate.y + crate.h;
           actor.vy = 0;
         }
+      }
+    }
+
+    // Rolling bodies shove actors sideways instead of passing through them.
+    for (const crate of world.crates) {
+      if (crate.id === actor.holdingCrateId) continue;
+      if (!rectsOverlap(actor, crate)) continue;
+      if (actor.y + actor.h <= crate.y + 4) continue; // standing on top
+      const actorCx = actor.x + actor.w * 0.5;
+      const crateCx = crate.x + crate.w * 0.5;
+      const dir = Math.sign(actorCx - crateCx) || (crate.vx > 0 ? 1 : -1);
+      // Only moving *toward* the actor counts as an impact. A crate being
+      // pushed by this actor is moving away; resolving that as a collision
+      // would push the actor back and break pushing entirely.
+      if (crate.vx * dir <= 0) continue;
+      actor.x = dir < 0 ? crate.x - actor.w - 0.01 : crate.x + crate.w + 0.01;
+      const relVx = (crate.vx - actor.vx) * dir;
+      if (relVx > 0) {
+        const invM1 = 1 / crate.mass;
+        const invM2 = 1 / Math.max(0.2, actor.mass);
+        const j = (1.05 * relVx) / (invM1 + invM2);
+        actor.vx += (j * invM2) * dir;
+        actor.knockbackVx = (j * invM2) * dir;
+        actor.knockbackTimer = 0.4;
+        crate.vx -= (j * invM1) * dir;
+        world.metrics.collisionCount += 1;
       }
     }
 
@@ -2084,33 +2360,14 @@ export function stepWorld(
     if (actor.holdingCrateId) {
       const held = world.crates.find((c) => c.id === actor.holdingCrateId);
       if (held) {
+        // Carry directly over the crown so the hands, cradle and silhouette share one axis.
         held.x = clamp(
-          actor.x + actor.w * 0.5 + actor.facing * 16 - held.w * 0.5,
+          actor.x + (actor.w - held.w) * 0.5,
           26,
           world.width - 26 - held.w
         );
-        held.y = clamp(actor.y - held.h * 0.55, 26, world.height - 48 - held.h);
-        for (const solid of staticSolids) {
-          if (rectsOverlap(held, solid)) {
-            const overlapLeft = held.x + held.w - solid.x;
-            const overlapRight = solid.x + solid.w - held.x;
-            const overlapTop = held.y + held.h - solid.y;
-            const overlapBottom = solid.y + solid.h - held.y;
-            const minX = Math.min(overlapLeft, overlapRight);
-            const minY = Math.min(overlapTop, overlapBottom);
-            if (minX <= minY) {
-              if (overlapLeft <= overlapRight) {
-                held.x = Math.max(26, solid.x - held.w);
-              } else {
-                held.x = Math.min(world.width - 26 - held.w, solid.x + solid.w);
-              }
-            } else if (overlapBottom <= overlapTop && solid.id !== 'floor-main') {
-              held.y = Math.min(world.height - 48 - held.h, solid.y + solid.h);
-            } else {
-              held.y = Math.max(26, solid.y - held.h);
-            }
-          }
-        }
+        held.y = clamp(actor.y - held.h - 6, 26, world.height - 48 - held.h);
+        resolveCrateStaticClearance(held, staticSolids, world);
         held.vx = actor.vx;
         held.vy = actor.vy;
         held.angle = 0;
@@ -2167,6 +2424,37 @@ export function stepWorld(
         newEvents.push(ev);
         pushWorldEvent(world, ev);
       }
+    }
+  }
+
+  // Standing on a teammate is a real relationship, not just a collision result.
+  // Recompute it after every actor has moved, so both participants get the same
+  // classification in the same tick.
+  const priorStack = new Map(
+    world.actors.map((actor) => [actor.id, { on: actor.standingOnActorId, kind: actor.stackKind }])
+  );
+  for (const actor of world.actors) {
+    actor.standingOnActorId = null;
+    actor.supportingActorId = null;
+    actor.stackKind = null;
+  }
+  for (const top of world.actors) {
+    if (!top.grounded || top.respawnTimer > 0) continue;
+    for (const bottom of world.actors) {
+      if (bottom.id === top.id || bottom.respawnTimer > 0) continue;
+      const overlap = Math.min(top.x + top.w, bottom.x + bottom.w) - Math.max(top.x, bottom.x);
+      if (overlap < 6) continue;
+      if (Math.abs(top.y + top.h - bottom.y) > 2.5) continue;
+      // A stack keeps the classification it was formed with. Re-deriving it every
+      // tick made a deliberate stack turn "accidental" after 1.8 s of standing.
+      const prior = priorStack.get(top.id);
+      const continuing = prior && prior.on === bottom.id ? prior.kind : null;
+      const deliberate = top.lastJumpTick !== undefined && world.tick - top.lastJumpTick <= 110;
+      top.standingOnActorId = bottom.id;
+      top.stackKind = continuing ?? (deliberate ? 'deliberate' : 'accidental');
+      bottom.supportingActorId = top.id;
+      bottom.stackKind = top.stackKind;
+      break;
     }
   }
 
@@ -2350,6 +2638,8 @@ export function buildAgentObservation(world: WorldState, actorId: string): Agent
         onExit: t.onExit,
         intent: t.lastInput.intent,
         targetId: t.lastInput.targetId,
+        claimTargetId: t.lastInput.claimTargetId,
+        message: t.lastInput.message,
       })),
     channels: { ...world.channels },
     plates: world.plates.map((p) => ({
@@ -2418,9 +2708,37 @@ export function buildAgentObservation(world: WorldState, actorId: string): Agent
     })),
     hazards: world.hazards.map((h) => ({ ...h })),
     forceZones: world.forceZones.map((f) => ({ ...f })),
+    messages: world.messages.map((m) => ({ ...m })),
     exit: {
       ...world.exit,
       unlocked: exitUnlocked,
     },
+    level: {
+      id: world.levelId,
+      name: world.levelName,
+      subtitle: world.levelSubtitle,
+      hint: world.levelHint,
+      isSandbox: world.isSandbox,
+    },
+    clock: {
+      tick: world.tick,
+      seconds: Math.round(world.metrics.elapsedSeconds * 100) / 100,
+      paused: world.paused,
+      timeScale: world.timeScale,
+    },
+    metrics: {
+      actorsAtExit: world.metrics.actorsAtExit,
+      totalActors: world.metrics.totalActors,
+      decisionsLogged: world.metrics.decisionsLogged,
+      solvedAtTick: world.solvedAtTick,
+    },
+    recentEvents: world.events.slice(-12).map((e) => ({
+      id: e.id,
+      tick: e.tick,
+      type: e.type,
+      message: e.message,
+      actorId: e.actorId,
+      entityId: e.entityId,
+    })),
   };
 }

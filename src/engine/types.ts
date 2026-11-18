@@ -29,6 +29,22 @@ export interface PhysicsConfig {
   actorMass: number;       // actor inertial mass (default 1.0)
 }
 
+export type AgentMessageKind = 'status' | 'claim' | 'request' | 'alert';
+
+export interface AgentMessage {
+  id: string;
+  tick: number;
+  timestamp: number;
+  actorId: string;
+  actorLabel: string;
+  actorName: string;
+  actorColor: string;
+  text: string;
+  kind: AgentMessageKind;
+  targetId?: string;
+  channel?: ChannelId;
+}
+
 export interface ActorInput {
   move: -1 | 0 | 1;
   jump: boolean;
@@ -37,9 +53,13 @@ export interface ActorInput {
   intent?: string;
   reason?: string;
   targetId?: string;
+  claimTargetId?: string;
   targetPos?: Vec2;
   pathPreview?: Vec2[];
   utility?: number;
+  message?: string;
+  messageKind?: AgentMessageKind;
+  messageChannel?: ChannelId;
 }
 
 export interface ActorState {
@@ -75,7 +95,30 @@ export interface ActorState {
   decisionsCount: number;
   squashX: number;
   squashY: number;
+  /** External horizontal shove from a moving body, in px/s. */
+  knockbackVx?: number;
+  knockbackTimer?: number;
+  /** Tick when the actor last left the ground under its own jump input. */
+  lastJumpTick?: number;
+  /** Set each tick when this actor is standing on a teammate. */
+  standingOnActorId?: string | null;
+  /** Set each tick when a teammate is standing on this actor. */
+  supportingActorId?: string | null;
+  /** Why the current stack formed; shared by both participants. */
+  stackKind?: 'deliberate' | 'accidental' | null;
+  /** How this actor is driven. Absent means the legacy path (WS/direct API). */
+  controller?: 'builtin' | 'external' | 'llm';
+  provider?: string;
+  model?: string;
+  controlMode?: LlmControlMode;
+  agentStatus?: LlmAgentStatus;
+  agentError?: string;
+  lastDecisionLatencyMs?: number;
 }
+
+export type LlmControlMode = 'hybrid' | 'direct';
+
+export type LlmAgentStatus = 'idle' | 'thinking' | 'acting' | 'error' | 'stopped';
 
 export interface PlatformDef {
   id: string;
@@ -228,6 +271,12 @@ export interface LevelDefinition {
   subtitle: string;
   hint: string;
   isSandbox?: boolean;
+  isCustom?: boolean;
+  generatorMeta?: {
+    seed: string;
+    archetype: string;
+    difficulty: string;
+  };
   width: number;
   height: number;
   spawns: Vec2[];
@@ -264,6 +313,7 @@ export interface TelemetryEvent {
     | 'crate:settled'
     | 'actor:respawn'
     | 'agent:decision'
+    | 'agent:message'
     | 'level:loaded'
     | 'puzzle:solved'
     | 'sandbox:edit'
@@ -315,6 +365,7 @@ export interface WorldState {
   forceZones: ForceZoneDef[];
   recentImpulses: ImpulseEffect[];
   exit: ExitZone;
+  messages: AgentMessage[];
   events: TelemetryEvent[];
   metrics: WorldMetrics;
 }
@@ -349,6 +400,8 @@ export interface AgentObservation {
     onExit: boolean;
     intent?: string;
     targetId?: string;
+    claimTargetId?: string;
+    message?: string;
   }>;
   channels: Record<ChannelId, boolean>;
   plates: Array<{ id: string; label: string; x: number; y: number; w: number; h: number; channel: ChannelId; mode: 'momentary' | 'latch'; active: boolean; pressedBy: string[] }>;
@@ -358,7 +411,38 @@ export interface AgentObservation {
   platforms: Array<{ id: string; x: number; y: number; w: number; h: number; kind: 'solid' | 'moving'; material: PlatformMaterial; conveyorSpeed?: number; bounceVelocity?: number; channel?: ChannelId; linkedIds?: string[]; logic?: 'ALL' | 'ANY'; startPos?: Vec2; endPos?: Vec2; loopWhenActive?: boolean }>;
   hazards: Array<{ id: string; x: number; y: number; w: number; h: number; kind: 'plasma' | 'spikes' }>;
   forceZones: ForceZoneDef[];
+  messages: AgentMessage[];
   exit: ExitZone & { unlocked: boolean };
+  /** Static level metadata for LLM system context. Optional for backwards compatibility. */
+  level?: {
+    id: string;
+    name: string;
+    subtitle: string;
+    hint: string;
+    isSandbox: boolean;
+  };
+  /** Wall-clock-ish simulation clock, not a transport timestamp. */
+  clock?: {
+    tick: number;
+    seconds: number;
+    paused: boolean;
+    timeScale: number;
+  };
+  metrics?: {
+    actorsAtExit: number;
+    totalActors: number;
+    decisionsLogged: number;
+    solvedAtTick: number | null;
+  };
+  /** Last few public telemetry events (no hidden server state). */
+  recentEvents?: Array<{
+    id: string;
+    tick: number;
+    type: string;
+    message: string;
+    actorId?: string;
+    entityId?: string;
+  }>;
 }
 
 export interface TraceRecord {
@@ -491,6 +575,14 @@ export type ClientWsMessage =
       type: 'input';
       actorId: string;
       input: ActorInput;
+    }
+  | {
+      type: 'message';
+      actorId?: string;
+      text: string;
+      kind?: AgentMessageKind;
+      targetId?: string;
+      channel?: ChannelId;
     }
   | {
       type: 'control';

@@ -14,20 +14,28 @@ import {
   ArrowLeftRight,
   ArrowUpDown,
   X,
+  MessageSquare,
+  Bot,
+  Sparkles,
+  Send,
 } from 'lucide-react';
 import { PHYSICS_PRESETS } from '../engine/levels';
+import type { LevelGeneratorOptions } from '../engine/levelGenerator';
 import { SANDBOX_TOOLS, type SandboxCanvasSelection, type SandboxToolSpec } from '../engine/sandboxTools';
 import type {
   ChannelId,
   DynamicBodyMaterial,
   EditableEntityPatch,
+  LevelDefinition,
   PhysicsConfig,
   PlatformMaterial,
   SandboxAction,
   WorldState,
 } from '../engine/types';
+import { ActorAvatar } from './ActorAvatar';
+import { LevelsPanel } from './LevelsPanel';
 
-export type InspectorTab = 'agents' | 'sandbox' | 'physics' | 'api';
+export type InspectorTab = 'agents' | 'levels' | 'sandbox' | 'physics' | 'api';
 
 interface TelemetryDockProps {
   world: WorldState | null;
@@ -42,8 +50,17 @@ interface TelemetryDockProps {
   onUpdatePhysics: (partial: Partial<PhysicsConfig>) => void;
   onApplyPhysicsPreset: (presetId: string) => void;
   onSpawnAgent: () => void;
+  onOpenAiAgentModal: () => void;
   onRemoveAgent: (actorId?: string) => void;
   onToggleHuman: (active: boolean) => void;
+  onSendMessage: (text: string) => void;
+  savedLevels: LevelDefinition[];
+  onGenerateLevel: (options: LevelGeneratorOptions) => Promise<LevelDefinition | null>;
+  onSaveCurrentLevel: (name: string) => Promise<LevelDefinition | null>;
+  onImportLevel: (rawJson: string) => Promise<{ ok: boolean; error?: string; level?: LevelDefinition }>;
+  onLoadSavedLevel: (level: LevelDefinition) => Promise<void>;
+  onDeleteSavedLevel: (levelId: string) => Promise<void>;
+  onExportCurrentLevel: () => void;
 }
 
 const CHANNEL_ACCENT: Record<ChannelId, string> = {
@@ -78,8 +95,17 @@ export function TelemetryDock({
   onUpdatePhysics,
   onApplyPhysicsPreset,
   onSpawnAgent,
+  onOpenAiAgentModal,
   onRemoveAgent,
   onToggleHuman,
+  onSendMessage,
+  savedLevels,
+  onGenerateLevel,
+  onSaveCurrentLevel,
+  onImportLevel,
+  onLoadSavedLevel,
+  onDeleteSavedLevel,
+  onExportCurrentLevel,
 }: TelemetryDockProps) {
   const [internalTab, setInternalTab] = useState<InspectorTab>('agents');
   const activeTab = controlledTab ?? internalTab;
@@ -90,6 +116,7 @@ export function TelemetryDock({
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [apiTestResult, setApiTestResult] = useState<string | null>(null);
   const [apiTestBusy, setApiTestBusy] = useState(false);
+  const [chatText, setChatText] = useState('');
 
   const origin =
     typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000';
@@ -130,8 +157,17 @@ export function TelemetryDock({
         }),
       });
       const inData = await inRes.json();
+      const msgRes = await fetch(`/api/agents/${encodeURIComponent(regData.actorId)}/message`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          kind: 'status',
+          text: 'REST probe ready for coordination',
+        }),
+      });
+      const msgData = await msgRes.json();
       setApiTestResult(
-        `Registered ${regData.actorId} (${regData.label}) and dispatched input at tick ${inData.tick}.`
+        `Registered ${regData.actorId} (${regData.label}), dispatched input at tick ${inData.tick}, and posted squad message (${msgData.ok ? 'ok' : 'failed'}).`
       );
     } catch (err) {
       setApiTestResult(err instanceof Error ? err.message : 'Network error');
@@ -141,6 +177,7 @@ export function TelemetryDock({
   };
 
   const agentCount = world?.actors.filter((a) => a.role === 'agent').length ?? 0;
+  const llmAgentCount = world?.actors.filter((a) => a.controller === 'llm').length ?? 0;
   const hasHuman = Boolean(world?.actors.some((a) => a.role === 'human'));
   const selectedToolSpec =
     SANDBOX_TOOLS.find((t) => t.id === sandboxSelection.tool) ?? SANDBOX_TOOLS[0];
@@ -148,7 +185,7 @@ export function TelemetryDock({
 
   return (
     <aside
-      className="w-full lg:w-[390px] xl:w-[410px] shrink-0 bg-[#101724] border-t lg:border-t-0 lg:border-l border-slate-800/90 flex flex-col h-full overflow-hidden"
+      className="w-full lg:w-[376px] xl:w-[400px] 2xl:w-[420px] shrink-0 bg-[#101724] border-t lg:border-t-0 lg:border-l border-slate-800/90 flex flex-col h-full overflow-hidden"
       aria-label="Real-time telemetry and control inspector"
     >
       {/* Top sync summary line */}
@@ -162,10 +199,10 @@ export function TelemetryDock({
         </div>
       </div>
 
-      {/* Segmented 4-tab bar */}
+      {/* Segmented 5-tab bar */}
       <div className="px-4 py-2.5 border-b border-slate-800/80">
         <div
-          className="grid grid-cols-4 gap-1 p-1 rounded-lg bg-[#0B1018] border border-slate-800/80"
+          className="grid grid-cols-5 gap-1 p-1 rounded-lg bg-[#0B1018] border border-slate-800/80"
           role="tablist"
         >
           <button
@@ -173,7 +210,7 @@ export function TelemetryDock({
             role="tab"
             aria-selected={activeTab === 'agents'}
             onClick={() => setActiveTab('agents')}
-            className={`px-1.5 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap ${
+            className={`px-1 py-1.5 text-[11px] font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap ${
               activeTab === 'agents'
                 ? 'bg-slate-800 text-slate-50'
                 : 'text-slate-400 hover:text-slate-200'
@@ -184,9 +221,22 @@ export function TelemetryDock({
           <button
             type="button"
             role="tab"
+            aria-selected={activeTab === 'levels'}
+            onClick={() => setActiveTab('levels')}
+            className={`px-1 py-1.5 text-[11px] font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap ${
+              activeTab === 'levels'
+                ? 'bg-slate-800 text-slate-50'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            Levels
+          </button>
+          <button
+            type="button"
+            role="tab"
             aria-selected={activeTab === 'sandbox'}
             onClick={() => setActiveTab('sandbox')}
-            className={`px-1.5 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap ${
+            className={`px-1 py-1.5 text-[11px] font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap ${
               activeTab === 'sandbox'
                 ? 'bg-slate-800 text-slate-50'
                 : 'text-slate-400 hover:text-slate-200'
@@ -199,7 +249,7 @@ export function TelemetryDock({
             role="tab"
             aria-selected={activeTab === 'physics'}
             onClick={() => setActiveTab('physics')}
-            className={`px-1.5 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap ${
+            className={`px-1 py-1.5 text-[11px] font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap ${
               activeTab === 'physics'
                 ? 'bg-slate-800 text-slate-50'
                 : 'text-slate-400 hover:text-slate-200'
@@ -212,7 +262,7 @@ export function TelemetryDock({
             role="tab"
             aria-selected={activeTab === 'api'}
             onClick={() => setActiveTab('api')}
-            className={`px-1.5 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap ${
+            className={`px-1 py-1.5 text-[11px] font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap ${
               activeTab === 'api'
                 ? 'bg-slate-800 text-slate-50'
                 : 'text-slate-400 hover:text-slate-200'
@@ -225,6 +275,18 @@ export function TelemetryDock({
 
       {/* Tab Body */}
       <div className="flex-1 overflow-y-auto px-4 py-3 space-y-4">
+        {activeTab === 'levels' && (
+          <LevelsPanel
+            world={world}
+            savedLevels={savedLevels}
+            onGenerateLevel={onGenerateLevel}
+            onSaveCurrentLevel={onSaveCurrentLevel}
+            onImportLevel={onImportLevel}
+            onLoadSavedLevel={onLoadSavedLevel}
+            onDeleteSavedLevel={onDeleteSavedLevel}
+            onExportCurrentLevel={onExportCurrentLevel}
+          />
+        )}
         {activeTab === 'agents' && (
           <>
             {/* Quick Roster Controls */}
@@ -236,7 +298,16 @@ export function TelemetryDock({
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-amber-500/15 hover:bg-amber-500/25 disabled:opacity-40 text-amber-300 border border-amber-500/30 text-xs font-medium transition-colors cursor-pointer whitespace-nowrap"
               >
                 <Plus className="w-3.5 h-3.5" />
-                Spawn Agent
+                Spawn Bot
+              </button>
+              <button
+                type="button"
+                onClick={onOpenAiAgentModal}
+                disabled={llmAgentCount >= 4}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-sky-500/15 hover:bg-sky-500/25 disabled:opacity-40 text-sky-300 border border-sky-500/30 text-xs font-medium transition-colors cursor-pointer whitespace-nowrap"
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                Spawn AI Agent
               </button>
               <button
                 type="button"
@@ -280,18 +351,48 @@ export function TelemetryDock({
                   return (
                     <div key={actor.id} className="py-3 first:pt-0 space-y-2">
                       <div className="flex items-center justify-between gap-2">
-                        <div className="flex items-center gap-2 min-w-0">
-                          <span
-                            className="w-2.5 h-2.5 rounded-sm shrink-0"
-                            style={{ backgroundColor: actor.color }}
-                            aria-hidden="true"
+                        <div className="flex items-center gap-2.5 min-w-0">
+                          <ActorAvatar
+                            name={actor.name}
+                            role={actor.role}
+                            color={actor.color}
+                            mood={
+                              actor.onExit
+                                ? 'happy'
+                                : actor.holdingCrateId
+                                  ? 'carrying'
+                                  : !actor.grounded
+                                    ? 'air'
+                                    : 'normal'
+                            }
+                            size={28}
                           />
-                          <span className="font-semibold text-sm text-slate-100 truncate">
-                            {actor.name}
-                          </span>
-                          <span className="font-mono text-xs text-slate-400 shrink-0">
-                            {actor.label} · {actor.role === 'human' ? (isYou ? 'You' : 'Human') : 'Agent'}
-                          </span>
+                          <div className="min-w-0">
+                            <div className="font-semibold text-sm text-slate-100 truncate leading-tight">
+                              {actor.name}
+                            </div>
+                            <div className="font-mono text-[11px] text-slate-400 truncate">
+                              {actor.label} · {actor.role === 'human' ? (isYou ? 'You' : 'Human') : 'Agent'}
+                            </div>
+                            {actor.controller === 'llm' && (
+                              <div className="mt-0.5 flex items-center gap-1.5 text-[10px] font-mono truncate">
+                                <span
+                                  className={
+                                    actor.agentStatus === 'error'
+                                      ? 'text-rose-300'
+                                      : actor.agentStatus === 'thinking'
+                                        ? 'text-amber-300'
+                                        : 'text-emerald-300'
+                                  }
+                                >
+                                  {actor.agentStatus ?? 'idle'}
+                                </span>
+                                <span className="text-slate-500 truncate">
+                                  {actor.provider}/{actor.model}
+                                </span>
+                              </div>
+                            )}
+                          </div>
                         </div>
                         {actor.role === 'agent' && (
                           <button
@@ -353,12 +454,110 @@ export function TelemetryDock({
                             {actor.lastInput.reason}
                           </div>
                         )}
+                        {actor.agentError && (
+                          <div className="text-rose-300 leading-snug break-words">
+                            {actor.agentError}
+                          </div>
+                        )}
                       </div>
                     </div>
                   );
                 })}
               </div>
             )}
+
+            {/* Squad Comms (Built-in + Drop-in External AI Agents) */}
+            <div className="pt-3 border-t border-slate-800/80 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 text-xs font-medium text-slate-300">
+                  <MessageSquare className="w-3.5 h-3.5 text-sky-400" />
+                  <span>Squad Comms</span>
+                </div>
+                <span className="font-mono text-[11px] text-slate-500 tabular-nums">
+                  {world?.messages.length ?? 0} msg
+                </span>
+              </div>
+              <div className="text-[11px] text-slate-400 leading-snug">
+                Shared board for built-in and drop-in agents (Gemini, Claude, DeepSeek) via{' '}
+                <code className="text-slate-300 font-mono">/api/agents/:id/message</code> or WS{' '}
+                <code className="text-slate-300 font-mono">message</code>.
+              </div>
+              <form
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  const text = chatText.trim();
+                  if (!text || !humanActorId) return;
+                  onSendMessage(text);
+                  setChatText('');
+                }}
+                className="flex items-center gap-1.5 pt-1"
+              >
+                <input
+                  value={chatText}
+                  onChange={(event) => setChatText(event.target.value)}
+                  maxLength={220}
+                  disabled={!humanActorId}
+                  aria-label="Squad message"
+                  placeholder={humanActorId ? 'Message your squad…' : 'Join as human to chat'}
+                  className="min-w-0 flex-1 rounded-md border border-slate-800 bg-[#0B1018] px-2.5 py-1.5 text-xs text-slate-200 placeholder:text-slate-600 outline-none focus:border-sky-500 disabled:opacity-50"
+                />
+                <button
+                  type="submit"
+                  disabled={!humanActorId || !chatText.trim()}
+                  className="inline-flex items-center gap-1 rounded-md border border-sky-500/30 bg-sky-500/15 px-2 py-1.5 text-[11px] font-medium text-sky-300 hover:bg-sky-500/25 disabled:opacity-40"
+                >
+                  <Send className="h-3 w-3" />
+                  Send
+                </button>
+              </form>
+              {!world || world.messages.length === 0 ? (
+                <div className="bg-[#0B1018] border border-slate-800/80 rounded-md px-2.5 py-3 text-xs text-slate-500 text-center">
+                  No coordination messages posted in this chamber yet.
+                </div>
+              ) : (
+                <div className="bg-[#0B1018] border border-slate-800/80 rounded-md divide-y divide-slate-800/70 max-h-[210px] overflow-y-auto">
+                  {[...world.messages]
+                    .reverse()
+                    .slice(0, 8)
+                    .map((msg) => {
+                      const kindStyle =
+                        msg.kind === 'request'
+                          ? 'text-amber-300 bg-amber-500/15 border-amber-500/30'
+                          : msg.kind === 'alert'
+                            ? 'text-rose-300 bg-rose-500/15 border-rose-500/30'
+                            : msg.kind === 'claim'
+                              ? 'text-sky-300 bg-sky-500/15 border-sky-500/30'
+                              : 'text-slate-300 bg-slate-800/80 border-slate-700';
+                      return (
+                        <div key={msg.id} className="px-2.5 py-2 space-y-1">
+                          <div className="flex items-center justify-between gap-2 text-[11px]">
+                            <div className="flex items-center gap-1.5 min-w-0">
+                              <span
+                                className="inline-block w-1.5 h-3 rounded-sm shrink-0"
+                                style={{ backgroundColor: msg.actorColor }}
+                              />
+                              <span className="font-mono font-semibold text-slate-200 truncate">
+                                {msg.actorLabel}
+                              </span>
+                              <span
+                                className={`px-1.5 py-0.5 rounded border font-mono text-[10px] uppercase leading-none ${kindStyle}`}
+                              >
+                                {msg.kind}
+                              </span>
+                            </div>
+                            <span className="font-mono text-slate-500 shrink-0 tabular-nums">
+                              T{msg.tick}
+                            </span>
+                          </div>
+                          <div className="text-xs text-slate-300 leading-snug break-words">
+                            {msg.text}
+                          </div>
+                        </div>
+                      );
+                    })}
+                </div>
+              )}
+            </div>
           </>
         )}
 
@@ -1609,9 +1808,13 @@ export function TelemetryDock({
                 <div className="text-slate-400 leading-relaxed break-all">
                   GET {origin}/api/state
                   <br />
+                  GET {origin}/api/messages
+                  <br />
                   POST {origin}/api/agents/register
                   <br />
                   POST {origin}/api/agents/:id/input
+                  <br />
+                  POST {origin}/api/agents/:id/message
                   <br />
                   POST {origin}/api/sim/physics
                   <br />
@@ -1627,6 +1830,52 @@ export function TelemetryDock({
                   <br />
                   POST {origin}/api/sandbox/clear
                 </div>
+              </div>
+
+              {/* Copyable Drop-In Agent Input + Message Payload */}
+              <div className="bg-[#0B1018] rounded-md p-2.5 border border-slate-800/80 space-y-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] font-medium text-slate-300">
+                    Drop-In Agent Input &amp; Comms Schema
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      copyText(
+                        'schema',
+                        JSON.stringify(
+                          {
+                            move: 1,
+                            jump: false,
+                            interact: false,
+                            grab: false,
+                            intent: 'Activate Switch B',
+                            claimTargetId: 'switch-b',
+                            message: 'Heading up to Switch B — hold Plate A',
+                            messageKind: 'request',
+                            messageChannel: 'A',
+                          },
+                          null,
+                          2
+                        )
+                      )
+                    }
+                    aria-label="Copy drop-in agent payload JSON"
+                    className="text-slate-400 hover:text-slate-200 cursor-pointer shrink-0"
+                  >
+                    {copiedKey === 'schema' ? (
+                      <Check className="w-3.5 h-3.5 text-emerald-400" />
+                    ) : (
+                      <Copy className="w-3.5 h-3.5" />
+                    )}
+                  </button>
+                </div>
+                <pre className="text-[11px] font-mono text-sky-300/90 leading-snug overflow-x-auto">{`{
+  "move": 1, "jump": false, "interact": false,
+  "claimTargetId": "switch-b",
+  "message": "Taking Switch B — hold Plate A",
+  "messageKind": "request", "messageChannel": "A"
+}`}</pre>
               </div>
             </div>
 

@@ -1,5 +1,7 @@
+import { useState } from 'react';
 import { LEVELS } from '../engine/levels';
 import type { WorldState } from '../engine/types';
+import { ActorAvatar } from './ActorAvatar';
 
 interface StatusModalProps {
   mode: 'paused' | 'solved';
@@ -7,6 +9,8 @@ interface StatusModalProps {
   onResume: () => void;
   onRestart: () => void;
   onNextLevel: () => void;
+  onGenerateNext?: () => void;
+  onSaveLevel?: () => Promise<void> | void;
   onExportTrace: () => void;
   onReturnTitle: () => void;
 }
@@ -17,10 +21,21 @@ export function StatusModal({
   onResume,
   onRestart,
   onNextLevel,
+  onGenerateNext,
+  onSaveLevel,
   onExportTrace,
   onReturnTitle,
 }: StatusModalProps) {
-  const hasNextLevel = world.levelIndex < LEVELS.length - 1;
+  const [savedNotice, setSavedNotice] = useState(false);
+  const builtInIdx = LEVELS.findIndex((l) => l.id === world.levelId);
+  const hasNextLevel = builtInIdx >= 0 && builtInIdx < LEVELS.length - 1;
+  const isGenerated = world.levelId.startsWith('gen-');
+
+  const handleSave = async () => {
+    if (!onSaveLevel) return;
+    await onSaveLevel();
+    setSavedNotice(true);
+  };
 
   return (
     <div
@@ -31,12 +46,31 @@ export function StatusModal({
       aria-label={mode === 'paused' ? 'Simulation Paused' : 'Puzzle Solved'}
     >
       <div className="w-full max-w-lg rounded-xl bg-[#131C2B] border border-slate-700/80 p-7 shadow-2xl">
-        <div className="text-xs font-mono text-slate-400 mb-1.5">
-          {world.levelName}
+        <div className="flex items-start justify-between gap-4 mb-2">
+          <div>
+            <div className="text-xs font-mono text-slate-400 mb-1">
+              {world.levelName}
+            </div>
+            <h2 className="font-display text-2xl font-bold text-slate-50">
+              {mode === 'paused' ? 'Simulation Paused' : 'Puzzle Solved'}
+            </h2>
+          </div>
+
+          {world.actors.length > 0 && (
+            <div className="flex items-center gap-1.5 shrink-0">
+              {world.actors.map((a) => (
+                <ActorAvatar
+                  key={a.id}
+                  name={a.name}
+                  role={a.role}
+                  color={a.color}
+                  mood={mode === 'solved' ? 'happy' : a.holdingCrateId ? 'carrying' : 'normal'}
+                  size={32}
+                />
+              ))}
+            </div>
+          )}
         </div>
-        <h2 className="font-display text-2xl font-bold text-slate-50 mb-2">
-          {mode === 'paused' ? 'Simulation Paused' : 'Puzzle Solved'}
-        </h2>
         <p className="text-sm text-slate-300 mb-6">
           {mode === 'paused'
             ? 'Physics ticks are frozen. Step forward frame-by-frame from the toolbar or resume real-time sync.'
@@ -61,7 +95,7 @@ export function StatusModal({
           </div>
           <div>
             <div className="text-xs text-slate-400">Decisions</div>
-            <div className="font-mono text-lg font-semibold text-slate-100 mt-0.5">
+            <div className="font-mono text-lg font-semibold text-slate-100 mt-0.5 tabular-nums">
               {world.metrics.decisionsLogged}
             </div>
           </div>
@@ -85,6 +119,15 @@ export function StatusModal({
             >
               Next Level
             </button>
+          ) : isGenerated && onGenerateNext ? (
+            <button
+              type="button"
+              data-start="true"
+              onClick={onGenerateNext}
+              className="px-5 py-2.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold text-sm transition-colors cursor-pointer whitespace-nowrap shrink-0"
+            >
+              Generate Next
+            </button>
           ) : (
             <button
               type="button"
@@ -104,6 +147,17 @@ export function StatusModal({
             Restart Level
           </button>
 
+          {mode === 'solved' && isGenerated && onSaveLevel && (
+            <button
+              type="button"
+              onClick={handleSave}
+              disabled={savedNotice}
+              className="px-4 py-2.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 disabled:opacity-60 text-amber-200 border border-amber-500/35 font-medium text-sm transition-colors cursor-pointer whitespace-nowrap shrink-0"
+            >
+              {savedNotice ? 'Saved' : 'Save Level'}
+            </button>
+          )}
+
           {mode === 'solved' && (
             <button
               type="button"
@@ -121,6 +175,16 @@ export function StatusModal({
           >
             Title
           </button>
+        </div>
+
+        <div className="mt-4 text-[11px] font-mono text-slate-500">
+          {mode === 'solved'
+            ? hasNextLevel
+              ? 'Enter / Space: Next Level · R: Restart · M: Mute'
+              : isGenerated
+                ? 'Enter / Space: Generate Next · R: Restart · M: Mute'
+                : 'Enter / Space: Play Again · R: Restart · M: Mute'
+            : 'P / Esc: Resume · R: Restart · M: Mute'}
         </div>
       </div>
     </div>

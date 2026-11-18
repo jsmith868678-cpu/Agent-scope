@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,15 +13,26 @@ import {
   buildAgentObservation,
   createWorld,
   FIXED_DT,
+  recordAgentMessage,
   removeActorFromWorld,
   softResetWorld,
   stepWorld,
   updateWorldPhysics,
 } from './src/engine/physics';
 import { createAgentMemory, decideAgentAction, type AgentPlannerMemory } from './src/engine/agentPlanner';
+import {
+  generateProceduralLevel,
+  parseAndValidateLevelJson,
+  worldToLevelDefinition,
+  type GeneratorArchetype,
+  type GeneratorDifficulty,
+} from './src/engine/levelGenerator';
+import { LlmAgentManager, LlmSpawnError } from './src/server/llm/manager';
 import type {
   ActorInput,
   ActorRole,
+  AgentMessageKind,
+  ChannelId,
   ClientWsMessage,
   LevelDefinition,
   PhysicsConfig,
@@ -32,6 +44,7 @@ import type {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT ?? 3000);
+const HOST = (process.env.HOST ?? '127.0.0.1').trim() || '127.0.0.1';
 
 interface ConnectedClient {
   id: string;
@@ -51,9 +64,17 @@ interface LocalAgentBot {
 
 const AGENT_NAMES = ['Relay-Alpha', 'Relay-Beta', 'Relay-Gamma', 'Relay-Delta'];
 
+function adminAuthorized(req: express.Request): boolean {
+  const token = (process.env.RELAYLAB_ADMIN_TOKEN ?? '').trim();
+  if (!token) return true;
+  return req.get('x-relaylab-admin-token') === token;
+}
+
 class CentralizedEngineServer {
   currentLevel: LevelDefinition = getLevelById('level-1');
   world: WorldState;
+  customLevels = new Map<string, LevelDefinition>();
+  customLevelOrder: string[] = [];
   inputs: Record<string, ActorInput> = {};
   clients = new Map<string, ConnectedClient>();
   localBots = new Map<string, LocalAgentBot>();
@@ -65,6 +86,22 @@ class CentralizedEngineServer {
 
   constructor() {
     this.world = createWorld(this.currentLevel, []);
+  }
+
+  resolveLevel(levelId: string): LevelDefinition | null {
+    return LEVELS.find((l) => l.id === levelId) ?? this.customLevels.get(levelId) ?? null;
+  }
+
+  registerCustomLevel(level: LevelDefinition): void {
+    this.customLevels.set(level.id, level);
+    this.customLevelOrder = this.customLevelOrder.filter((id) => id !== level.id);
+    this.customLevelOrder.push(level.id);
+    while (this.customLevelOrder.length > 48) {
+      const oldest = this.customLevelOrder.shift();
+      if (oldest && oldest !== this.currentLevel.id) {
+        this.customLevels.delete(oldest);
+      }
+    }
   }
 
   recordTrace(): void {
@@ -92,8 +129,7 @@ class CentralizedEngineServer {
     }
   }
 
-  loadLevel(levelId: string, preserveActors = true, preservePhysics = false): void {
-    const nextLevel = getLevelById(levelId);
+  loadLevelDefinition(nextLevel: LevelDefinition, preserveActors = true, preservePhysics = false): void {
     const prevActors = preserveActors
       ? this.world.actors.map((a) => ({
           id: a.id,
@@ -112,6 +148,11 @@ class CentralizedEngineServer {
       bot.memory = createAgentMemory();
     }
     this.broadcastState();
+  }
+
+  loadLevel(levelId: string, preserveActors = true, preservePhysics = false): void {
+    const nextLevel = this.resolveLevel(levelId) ?? getLevelById(levelId);
+    this.loadLevelDefinition(nextLevel, preserveActors, preservePhysics);
   }
 
   resetLevel(): void {
@@ -329,17 +370,27 @@ class CentralizedEngineServer {
   }
 
   broadcastState(): void {
+    let sharedStateJson: string | null = null;
     for (const client of this.clients.values()) {
       if (client.ws.readyState !== WebSocket.OPEN) continue;
-      const msg: ServerWsMessage = {
-        type: 'state',
-        world: this.world,
-        observation:
-          client.role === 'agent' && client.actorId
-            ? buildAgentObservation(this.world, client.actorId) ?? undefined
-            : undefined,
-      };
-      client.ws.send(JSON.stringify(msg));
+      if (client.role === 'agent' && client.actorId) {
+        const obs = buildAgentObservation(this.world, client.actorId) ?? undefined;
+        const msg: ServerWsMessage = {
+          type: 'state',
+          world: this.world,
+          observation: obs,
+        };
+        client.ws.send(JSON.stringify(msg));
+      } else {
+        if (sharedStateJson === null) {
+          const msg: ServerWsMessage = {
+            type: 'state',
+            world: this.world,
+          };
+          sharedStateJson = JSON.stringify(msg);
+        }
+        client.ws.send(sharedStateJson);
+      }
     }
   }
 }
@@ -350,6 +401,27 @@ async function startServer() {
 
   const server = http.createServer(app);
   const engine = new CentralizedEngineServer();
+  const llm = new LlmAgentManager({
+    getWorld: () => engine.world,
+    addActor: ({ id, name }) =>
+      addActorToWorld(engine.world, engine.currentLevel, {
+        id,
+        name,
+        role: 'agent',
+        connected: true,
+      }),
+    removeActor: (actorId) => engine.removeAgent(actorId),
+    buildObservation: (actorId) => buildAgentObservation(engine.world, actorId),
+    setInput: (actorId, input) => {
+      engine.inputs[actorId] = input;
+    },
+    recordMessage: (actorId, text, opts) => {
+      const recorded = recordAgentMessage(engine.world, actorId, text, opts);
+      if (recorded) engine.broadcastState();
+      return Boolean(recorded);
+    },
+    broadcast: () => engine.broadcastState(),
+  });
   const wss = new WebSocketServer({ server, path: '/ws' });
 
   wss.on('connection', (ws) => {
@@ -414,6 +486,26 @@ async function startServer() {
             const actor = engine.world.actors.find((a) => a.id === targetId);
             if (actor) {
               actor.lastDecisionAt = Date.now();
+              if ((engine.world.paused || engine.world.solved) && typeof msg.input.message === 'string' && msg.input.message.trim()) {
+                const recorded = recordAgentMessage(engine.world, targetId, msg.input.message, {
+                  kind: msg.input.messageKind,
+                  targetId: msg.input.claimTargetId ?? msg.input.targetId,
+                  channel: msg.input.messageChannel,
+                });
+                if (recorded) engine.broadcastState();
+              }
+            }
+          }
+        } else if (msg.type === 'message') {
+          const senderId = msg.actorId || client.actorId;
+          if (senderId && typeof msg.text === 'string') {
+            const recorded = recordAgentMessage(engine.world, senderId, msg.text, {
+              kind: msg.kind,
+              targetId: msg.targetId,
+              channel: msg.channel,
+            });
+            if (recorded) {
+              engine.broadcastState();
             }
           }
         } else if (msg.type === 'control') {
@@ -471,18 +563,22 @@ async function startServer() {
       tickRateHz: 60,
       connections: engine.clients.size,
       actors: engine.world.actors.length,
+      llmAgents: llm.count(),
     });
   });
 
   app.get('/api/levels', (_req, res) => {
+    const allLevels = [...LEVELS, ...Array.from(engine.customLevels.values())];
     res.json({
-      levels: LEVELS.map((l) => ({
+      levels: allLevels.map((l) => ({
         id: l.id,
         index: l.index,
         name: l.name,
         subtitle: l.subtitle,
         hint: l.hint,
         isSandbox: Boolean(l.isSandbox),
+        isCustom: Boolean(l.isCustom),
+        generatorMeta: l.generatorMeta,
       })),
     });
   });
@@ -516,6 +612,40 @@ async function startServer() {
     });
   });
 
+  app.get('/api/llm/providers', (_req, res) => {
+    res.json({ providers: llm.providers() });
+  });
+
+  app.post('/api/agents/llm', (req, res) => {
+    if (!adminAuthorized(req)) {
+      res.status(403).json({ error: 'Admin token required' });
+      return;
+    }
+    try {
+      const body = req.body ?? {};
+      const result = llm.spawn({
+        name: typeof body.name === 'string' ? body.name : '',
+        provider: typeof body.provider === 'string' ? body.provider : 'mock',
+        model: typeof body.model === 'string' ? body.model : undefined,
+        persona: typeof body.persona === 'string' ? body.persona : undefined,
+        controlMode: body.controlMode === 'direct' ? 'direct' : 'hybrid',
+      });
+      res.status(201).json({
+        actorId: result.actor.id,
+        actor: result.actor,
+        status: result.status,
+        contextUrl: `/api/agents/${encodeURIComponent(result.actor.id)}/context`,
+        statusUrl: `/api/agents/${encodeURIComponent(result.actor.id)}/llm`,
+      });
+    } catch (error) {
+      if (error instanceof LlmSpawnError) {
+        res.status(error.statusCode).json({ error: error.message });
+        return;
+      }
+      res.status(500).json({ error: 'Failed to spawn LLM agent' });
+    }
+  });
+
   app.post('/api/agents/register', (req, res) => {
     const name = typeof req.body?.name === 'string' && req.body.name.trim()
       ? req.body.name.trim()
@@ -541,6 +671,7 @@ async function startServer() {
       wsPath: '/ws',
       stateUrl: `/api/state?actorId=${encodeURIComponent(actor.id)}`,
       inputUrl: `/api/agents/${encodeURIComponent(actor.id)}/input`,
+      messageUrl: `/api/agents/${encodeURIComponent(actor.id)}/message`,
       observation: buildAgentObservation(engine.world, actor.id),
     });
   });
@@ -554,6 +685,8 @@ async function startServer() {
     }
     const moveRaw = Number(req.body?.move ?? 0);
     const move: -1 | 0 | 1 = moveRaw > 0 ? 1 : moveRaw < 0 ? -1 : 0;
+    const validKinds: AgentMessageKind[] = ['status', 'claim', 'request', 'alert'];
+    const validChannels: ChannelId[] = ['A', 'B', 'C'];
     const input: ActorInput = {
       move,
       jump: Boolean(req.body?.jump),
@@ -562,9 +695,21 @@ async function startServer() {
       intent: typeof req.body?.intent === 'string' ? req.body.intent : 'REST API Command',
       reason: typeof req.body?.reason === 'string' ? req.body.reason : 'Submitted via /api/agents/:id/input',
       targetId: typeof req.body?.targetId === 'string' ? req.body.targetId : undefined,
+      claimTargetId: typeof req.body?.claimTargetId === 'string' ? req.body.claimTargetId : undefined,
+      message: typeof req.body?.message === 'string' ? req.body.message : undefined,
+      messageKind: validKinds.includes(req.body?.messageKind) ? req.body.messageKind : undefined,
+      messageChannel: validChannels.includes(req.body?.messageChannel) ? req.body.messageChannel : undefined,
     };
     engine.inputs[actorId] = input;
     actor.lastDecisionAt = Date.now();
+    if ((engine.world.paused || engine.world.solved) && input.message && input.message.trim()) {
+      const recorded = recordAgentMessage(engine.world, actorId, input.message, {
+        kind: input.messageKind,
+        targetId: input.claimTargetId ?? input.targetId,
+        channel: input.messageChannel,
+      });
+      if (recorded) engine.broadcastState();
+    }
     res.json({
       accepted: true,
       actorId,
@@ -573,7 +718,96 @@ async function startServer() {
     });
   });
 
+  app.get('/api/messages', (_req, res) => {
+    res.json({
+      tick: engine.world.tick,
+      messages: engine.world.messages,
+      claims: engine.world.actors.map((a) => ({
+        actorId: a.id,
+        name: a.name,
+        label: a.label,
+        intent: a.lastInput.intent,
+        claimTargetId: a.lastInput.claimTargetId ?? a.lastInput.targetId,
+      })),
+    });
+  });
+
+  app.post('/api/agents/:id/message', (req, res) => {
+    const actorId = req.params.id;
+    const actor = engine.world.actors.find((a) => a.id === actorId);
+    if (!actor) {
+      res.status(404).json({ error: `Actor '${actorId}' not found` });
+      return;
+    }
+    const rawText = typeof req.body?.text === 'string' ? req.body.text : req.body?.message;
+    if (typeof rawText !== 'string' || !rawText.trim()) {
+      res.status(400).json({ error: 'Requires non-empty text (or message) field' });
+      return;
+    }
+    const validKinds: AgentMessageKind[] = ['status', 'claim', 'request', 'alert'];
+    const kind: AgentMessageKind = validKinds.includes(req.body?.kind) ? req.body.kind : 'status';
+    const targetId = typeof req.body?.targetId === 'string' ? req.body.targetId : undefined;
+    const validChannels: ChannelId[] = ['A', 'B', 'C'];
+    const channel: ChannelId | undefined = validChannels.includes(req.body?.channel) ? req.body.channel : undefined;
+
+    const recorded = recordAgentMessage(engine.world, actorId, rawText, { kind, targetId, channel });
+    actor.lastDecisionAt = Date.now();
+    if (recorded) {
+      engine.broadcastState();
+    }
+    res.status(201).json({
+      ok: true,
+      deduped: recorded === null,
+      tick: engine.world.tick,
+      message: recorded,
+      messages: engine.world.messages,
+    });
+  });
+
+  app.get('/api/agents/:id/context', (req, res) => {
+    const context = llm.contextFor(req.params.id);
+    if (!context) {
+      res.status(404).json({ error: `Actor '${req.params.id}' not found` });
+      return;
+    }
+    res.json({
+      ...context,
+      observationUrl: `/api/state?actorId=${encodeURIComponent(req.params.id)}`,
+      inputUrl: `/api/agents/${encodeURIComponent(req.params.id)}/input`,
+      messageUrl: `/api/agents/${encodeURIComponent(req.params.id)}/message`,
+    });
+  });
+
+  app.get('/api/agents/:id/llm', (req, res) => {
+    const status = llm.getStatus(req.params.id);
+    if (!status) {
+      res.status(404).json({ error: `No LLM runner for actor '${req.params.id}'` });
+      return;
+    }
+    res.json({ status });
+  });
+
+  app.delete('/api/agents/llm/:id', (req, res) => {
+    if (!adminAuthorized(req)) {
+      res.status(403).json({ error: 'Admin token required' });
+      return;
+    }
+    if (!llm.stop(req.params.id)) {
+      res.status(404).json({ error: `No LLM runner for actor '${req.params.id}'` });
+      return;
+    }
+    res.json({ removed: true, actorId: req.params.id });
+  });
+
   app.delete('/api/agents/:id', (req, res) => {
+    if (!adminAuthorized(req)) {
+      res.status(403).json({ error: 'Admin token required' });
+      return;
+    }
+    if (llm.stop(req.params.id)) {
+      res.json({ removed: true, actorId: req.params.id });
+      return;
+    }
     const removed = engine.removeAgent(req.params.id);
     if (!removed) {
       res.status(404).json({ error: `Actor '${req.params.id}' not found` });
@@ -583,13 +817,131 @@ async function startServer() {
   });
 
   app.post('/api/level/load', (req, res) => {
+    if (req.body?.level) {
+      const parsed = parseAndValidateLevelJson(req.body.level);
+      if (!parsed.ok) {
+        res.status(400).json({ error: parsed.error });
+        return;
+      }
+      engine.registerCustomLevel(parsed.level);
+      engine.loadLevelDefinition(parsed.level, true, false);
+      res.json({
+        loaded: true,
+        levelId: engine.currentLevel.id,
+        level: engine.currentLevel,
+        world: engine.world,
+      });
+      return;
+    }
+
     const levelId = typeof req.body?.levelId === 'string' ? req.body.levelId : 'level-1';
-    if (!LEVELS.some((l) => l.id === levelId)) {
+    const found = engine.resolveLevel(levelId);
+    if (!found) {
       res.status(404).json({ error: `Unknown level '${levelId}'` });
       return;
     }
-    engine.loadLevel(levelId, true, false);
-    res.json({ loaded: true, levelId: engine.currentLevel.id, world: engine.world });
+    engine.loadLevelDefinition(found, true, false);
+    res.json({
+      loaded: true,
+      levelId: engine.currentLevel.id,
+      level: engine.currentLevel,
+      world: engine.world,
+    });
+  });
+
+  app.post('/api/levels/generate', (req, res) => {
+    const body = req.body ?? {};
+    const validArch: GeneratorArchetype[] = ['auto', 'relay', 'counterweight', 'shaft', 'cascade'];
+    const validDiff: GeneratorDifficulty[] = ['standard', 'tactical', 'chaos'];
+    const archetype: GeneratorArchetype = validArch.includes(body.archetype) ? body.archetype : 'auto';
+    const difficulty: GeneratorDifficulty = validDiff.includes(body.difficulty)
+      ? body.difficulty
+      : 'tactical';
+
+    const level = generateProceduralLevel(
+      {
+        seed: typeof body.seed === 'string' ? body.seed : undefined,
+        archetype,
+        difficulty,
+        includeCrates: body.includeCrates !== false,
+        includeConveyors: body.includeConveyors !== false,
+        includeWind: body.includeWind !== false,
+        includeHazards: body.includeHazards !== false,
+      },
+      true
+    );
+
+    engine.registerCustomLevel(level);
+    if (body.load !== false) {
+      engine.loadLevelDefinition(level, true, false);
+    }
+    res.status(201).json({
+      ok: true,
+      level,
+      world: engine.world,
+    });
+  });
+
+  app.post('/api/levels/save', (req, res) => {
+    const body = req.body ?? {};
+    let level: LevelDefinition;
+    if (body.level) {
+      const parsed = parseAndValidateLevelJson(body.level);
+      if (!parsed.ok) {
+        res.status(400).json({ error: parsed.error });
+        return;
+      }
+      level = parsed.level;
+    } else {
+      level = worldToLevelDefinition(engine.world, {
+        name: typeof body.name === 'string' ? body.name : undefined,
+        subtitle: typeof body.subtitle === 'string' ? body.subtitle : undefined,
+        hint: typeof body.hint === 'string' ? body.hint : undefined,
+      });
+      if (engine.currentLevel.id === engine.world.levelId && engine.currentLevel.generatorMeta) {
+        level.generatorMeta = { ...engine.currentLevel.generatorMeta };
+      }
+    }
+    engine.registerCustomLevel(level);
+    res.status(201).json({ ok: true, level });
+  });
+
+  app.post('/api/levels/import', (req, res) => {
+    const payload = req.body?.json !== undefined ? req.body.json : req.body;
+    const parsed = parseAndValidateLevelJson(payload);
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    engine.registerCustomLevel(parsed.level);
+    if (req.body?.load !== false) {
+      engine.loadLevelDefinition(parsed.level, true, false);
+    }
+    res.status(201).json({
+      ok: true,
+      level: parsed.level,
+      world: engine.world,
+    });
+  });
+
+  app.post('/api/levels/sync', (req, res) => {
+    const rawList = Array.isArray(req.body?.levels) ? req.body.levels : [];
+    let count = 0;
+    for (const item of rawList.slice(0, 48)) {
+      const parsed = parseAndValidateLevelJson(item);
+      if (parsed.ok) {
+        engine.registerCustomLevel(parsed.level);
+        count += 1;
+      }
+    }
+    res.json({ ok: true, count });
+  });
+
+  app.delete('/api/levels/:id', (req, res) => {
+    const id = req.params.id;
+    const removed = engine.customLevels.delete(id);
+    engine.customLevelOrder = engine.customLevelOrder.filter((k) => k !== id);
+    res.json({ ok: true, removed });
   });
 
   app.post('/api/sim/control', (req, res) => {
@@ -746,13 +1098,22 @@ async function startServer() {
     app.use(vite.middlewares);
   }
 
-  // Fixed-rate simulation broadcast loop (~60Hz)
-  setInterval(() => {
+  // Drift-compensated fixed-rate simulation loop (60Hz)
+  const tickIntervalMs = FIXED_DT * 1000;
+  let nextTickAt = performance.now() + tickIntervalMs;
+  const runTickLoop = () => {
     engine.tick();
-  }, 16);
+    const now = performance.now();
+    nextTickAt += tickIntervalMs;
+    if (nextTickAt < now - 100) {
+      nextTickAt = now + tickIntervalMs;
+    }
+    setTimeout(runTickLoop, Math.max(1, nextTickAt - now));
+  };
+  setTimeout(runTickLoop, tickIntervalMs);
 
-  server.listen(PORT, '0.0.0.0', () => {
-    console.log(`RelayLab centralized server listening on http://0.0.0.0:${PORT}`);
+  server.listen(PORT, HOST, () => {
+    console.log(`RelayLab centralized server listening on http://${HOST}:${PORT}`);
     // Spawn two real WebSocket collaborative agents by default so the arena is alive on first arrival
     setTimeout(() => {
       engine.spawnLocalAgent('Relay-Alpha');

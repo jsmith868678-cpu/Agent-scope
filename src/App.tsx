@@ -1,8 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  Dices,
   Download,
   Eye,
   EyeOff,
+  Layers,
+  PanelRightClose,
+  PanelRightOpen,
   Pause,
   Play,
   RotateCcw,
@@ -13,22 +17,50 @@ import {
 } from 'lucide-react';
 import { GameCanvas } from './components/GameCanvas';
 import { StatusModal } from './components/StatusModal';
+import { SpawnAiAgentModal, type SpawnAiAgentConfig } from './components/SpawnAiAgentModal';
 import { TelemetryDock, type InspectorTab } from './components/TelemetryDock';
 import { TitleScreen } from './components/TitleScreen';
 import { LEVELS } from './engine/levels';
+import {
+  parseAndValidateLevelJson,
+  serializeLevelPackage,
+  worldToLevelDefinition,
+  type LevelGeneratorOptions,
+} from './engine/levelGenerator';
 import { SANDBOX_TOOLS, type SandboxCanvasSelection } from './engine/sandboxTools';
-import type { ActorInput, PhysicsConfig, SandboxAction } from './engine/types';
+import type { ActorInput, LevelDefinition, PhysicsConfig, SandboxAction } from './engine/types';
 import { useEngineSocket } from './hooks/useEngineSocket';
 import { soundFX } from './utils/sound';
 
 type AppShellState = 'title' | 'playing' | 'paused' | 'gameover';
+
+const SAVED_LEVELS_STORAGE_KEY = 'relaylab-saved-levels';
+
+function loadSavedLevelsFromStorage(): LevelDefinition[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = window.localStorage.getItem(SAVED_LEVELS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const valid: LevelDefinition[] = [];
+    for (const item of parsed) {
+      const check = parseAndValidateLevelJson(item);
+      if (check.ok) valid.push(check.level);
+    }
+    return valid;
+  } catch {
+    return [];
+  }
+}
 
 const LEVEL_SHORT_LABELS: Record<string, string> = {
   'level-1': '01. Relay',
   'level-2': '02. Crate',
   'level-3': '03. Lift',
   'level-4': '04. Vault',
-  sandbox: '05. Sandbox',
+  'level-5': '05. Cascade',
+  sandbox: '06. Sandbox',
 };
 
 export default function App() {
@@ -43,6 +75,7 @@ export default function App() {
     sendInput,
     sendControl,
     sendSandbox,
+    sendMessage,
   } = useEngineSocket();
 
   const [shellState, setShellState] = useState<AppShellState>(() => {
@@ -56,8 +89,19 @@ export default function App() {
   });
 
   const [showAgentPlans, setShowAgentPlans] = useState(true);
-  const [muted, setMuted] = useState(false);
+  const [aiSpawnOpen, setAiSpawnOpen] = useState(false);
+  const [muted, setMuted] = useState(() => {
+    try {
+      return typeof window !== 'undefined' && window.localStorage.getItem('relaylab-muted') === '1';
+    } catch {
+      return false;
+    }
+  });
   const [activeDockTab, setActiveDockTab] = useState<InspectorTab>('agents');
+  const [dockOpen, setDockOpen] = useState(true);
+  const [savedLevels, setSavedLevels] = useState<LevelDefinition[]>(() =>
+    loadSavedLevelsFromStorage()
+  );
   const [sandboxSelection, setSandboxSelection] = useState<SandboxCanvasSelection>({
     tool: 'pointer',
     channel: 'A',
@@ -71,10 +115,33 @@ export default function App() {
   const autoStartedRef = useRef(false);
   const awaitingResetRef = useRef(false);
 
-  // Sync game state machine to document.body.dataset.state
+  // Sync game state machine to document.body.dataset.state & soundFX mute state
   useEffect(() => {
     document.body.dataset.state = shellState;
   }, [shellState]);
+
+  useEffect(() => {
+    soundFX.muted = muted;
+  }, [muted]);
+
+  const persistSavedLevels = useCallback((next: LevelDefinition[]) => {
+    setSavedLevels(next);
+    try {
+      window.localStorage.setItem(SAVED_LEVELS_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // Ignore storage quota issues
+    }
+  }, []);
+
+  // Sync localStorage saved custom levels to server registry on connect
+  useEffect(() => {
+    if (!connected || savedLevels.length === 0) return;
+    fetch('/api/levels/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ levels: savedLevels }),
+    }).catch(() => {});
+  }, [connected, savedLevels]);
 
   // Handle ?autostart=1 (& optional ?level=sandbox) once connected
   useEffect(() => {
@@ -123,6 +190,7 @@ export default function App() {
       if (ev.type === 'plate:activated') soundFX.playPlate();
       else if (ev.type === 'switch:toggled') soundFX.playSwitch();
       else if (ev.type === 'door:opened') soundFX.playDoorOpen();
+      else if (ev.type === 'door:closed') soundFX.playDoorClose();
       else if (ev.type === 'actor:respawn') soundFX.playRespawn();
       else if (ev.type === 'puzzle:solved') soundFX.playSolved();
     }
@@ -132,6 +200,26 @@ export default function App() {
     role === 'human'
       ? assignedActorId ?? world?.actors.find((a) => a.role === 'human')?.id ?? null
       : null;
+
+  const handleSpawnAiAgent = useCallback(async (config: SpawnAiAgentConfig) => {
+    const response = await fetch('/api/agents/llm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config),
+    });
+    const data = (await response.json().catch(() => ({}))) as { error?: string };
+    if (!response.ok) {
+      throw new Error(data.error || `Could not spawn AI agent (${response.status})`);
+    }
+  }, []);
+
+  const handleSendSquadMessage = useCallback(
+    (text: string) => {
+      if (!humanActorId) return;
+      sendMessage(humanActorId, text, 'status');
+    },
+    [humanActorId, sendMessage]
+  );
 
   const focusCanvas = useCallback(() => {
     const active = document.activeElement as HTMLElement | null;
@@ -200,17 +288,149 @@ export default function App() {
     focusCanvas();
   }, [focusCanvas, sendControl]);
 
+  const handleGenerateLevel = useCallback(
+    async (options: LevelGeneratorOptions): Promise<LevelDefinition | null> => {
+      try {
+        keysRef.current.clear();
+        awaitingResetRef.current = true;
+        setSandboxSelection((prev) => ({ ...prev, selectedEntityId: null }));
+        const response = await fetch('/api/levels/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...options, load: true }),
+        });
+        if (!response.ok) return null;
+        const data = (await response.json()) as { level?: LevelDefinition };
+        sendControl('resume');
+        if (shellState !== 'title') {
+          setShellState('playing');
+        }
+        focusCanvas();
+        return data.level ?? null;
+      } catch {
+        return null;
+      }
+    },
+    [focusCanvas, sendControl, shellState]
+  );
+
+  const handleSaveCurrentLevel = useCallback(
+    async (name: string): Promise<LevelDefinition | null> => {
+      try {
+        const response = await fetch('/api/levels/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: name.trim() || undefined }),
+        });
+        if (!response.ok) return null;
+        const data = (await response.json()) as { level?: LevelDefinition };
+        if (!data.level) return null;
+        const next = [data.level, ...savedLevels.filter((l) => l.id !== data.level!.id)].slice(0, 40);
+        persistSavedLevels(next);
+        return data.level;
+      } catch {
+        return null;
+      }
+    },
+    [persistSavedLevels, savedLevels]
+  );
+
+  const handleImportLevel = useCallback(
+    async (rawJson: string): Promise<{ ok: boolean; error?: string; level?: LevelDefinition }> => {
+      try {
+        const response = await fetch('/api/levels/import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ json: rawJson, load: true }),
+        });
+        const data = (await response.json().catch(() => ({}))) as {
+          ok?: boolean;
+          error?: string;
+          level?: LevelDefinition;
+        };
+        if (!response.ok || !data.level) {
+          return { ok: false, error: data.error || `Import failed (${response.status})` };
+        }
+        keysRef.current.clear();
+        awaitingResetRef.current = true;
+        setSandboxSelection((prev) => ({ ...prev, selectedEntityId: null }));
+        const next = [data.level, ...savedLevels.filter((l) => l.id !== data.level!.id)].slice(0, 40);
+        persistSavedLevels(next);
+        sendControl('resume');
+        if (shellState !== 'title') {
+          setShellState('playing');
+        }
+        focusCanvas();
+        return { ok: true, level: data.level };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+      }
+    },
+    [focusCanvas, persistSavedLevels, savedLevels, sendControl, shellState]
+  );
+
+  const handleLoadSavedLevel = useCallback(
+    async (level: LevelDefinition) => {
+      keysRef.current.clear();
+      awaitingResetRef.current = true;
+      setSandboxSelection((prev) => ({ ...prev, selectedEntityId: null }));
+      await fetch('/api/level/load', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ level }),
+      }).catch(() => {});
+      sendControl('resume');
+      if (shellState !== 'title') {
+        setShellState('playing');
+      }
+      focusCanvas();
+    },
+    [focusCanvas, sendControl, shellState]
+  );
+
+  const handleDeleteSavedLevel = useCallback(
+    async (levelId: string) => {
+      persistSavedLevels(savedLevels.filter((l) => l.id !== levelId));
+      await fetch(`/api/levels/${encodeURIComponent(levelId)}`, { method: 'DELETE' }).catch(() => {});
+    },
+    [persistSavedLevels, savedLevels]
+  );
+
+  const handleExportCurrentLevel = useCallback(() => {
+    const cur = worldRef.current;
+    if (!cur) return;
+    const def = worldToLevelDefinition(cur, { id: cur.levelId, name: cur.levelName });
+    const pkg = serializeLevelPackage(def);
+    const blob = new Blob([pkg], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${cur.levelId}.relaylab.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }, [worldRef]);
+
   const handleNextLevel = useCallback(() => {
     if (!world) return;
-    const nextIdx = Math.min(LEVELS.length - 1, world.levelIndex + 1);
-    const nextLevel = LEVELS[nextIdx];
-    keysRef.current.clear();
-    awaitingResetRef.current = true;
-    sendControl('load_level', nextLevel.id);
-    sendControl('resume');
-    setShellState('playing');
-    focusCanvas();
-  }, [focusCanvas, sendControl, world]);
+    const builtInIdx = LEVELS.findIndex((l) => l.id === world.levelId);
+    if (builtInIdx >= 0 && builtInIdx < LEVELS.length - 1) {
+      const nextLevel = LEVELS[builtInIdx + 1];
+      keysRef.current.clear();
+      awaitingResetRef.current = true;
+      sendControl('load_level', nextLevel.id);
+      sendControl('resume');
+      setShellState('playing');
+      focusCanvas();
+      return;
+    }
+    if (world.levelId.startsWith('gen-')) {
+      void handleGenerateLevel({ archetype: 'auto', difficulty: 'tactical' });
+      return;
+    }
+    handleRestartLevel();
+  }, [focusCanvas, handleGenerateLevel, handleRestartLevel, sendControl, world]);
 
   const handleSelectLevel = useCallback(
     (levelId: string) => {
@@ -241,6 +461,11 @@ export default function App() {
     setMuted((prev) => {
       const next = !prev;
       soundFX.muted = next;
+      try {
+        window.localStorage.setItem('relaylab-muted', next ? '1' : '0');
+      } catch {
+        // Ignore storage errors in restricted iframes
+      }
       return next;
     });
   }, []);
@@ -265,6 +490,7 @@ export default function App() {
     setSandboxSelection((prev) => ({ ...prev, selectedEntityId: entityId }));
     if (entityId) {
       setActiveDockTab('sandbox');
+      setDockOpen(true);
     }
   }, []);
 
@@ -273,6 +499,7 @@ export default function App() {
       const entering = prev.tool !== 'edit';
       if (entering) {
         setActiveDockTab('sandbox');
+        setDockOpen(true);
       }
       return {
         ...prev,
@@ -336,6 +563,22 @@ export default function App() {
         if (e.code === 'Enter' || e.code === 'Space') {
           e.preventDefault();
           handleStartPlay();
+        }
+        return;
+      }
+
+      if (shellState === 'gameover') {
+        if (e.code === 'Enter' || e.code === 'Space') {
+          e.preventDefault();
+          const curWorld = worldRef.current;
+          const builtInIdx = curWorld ? LEVELS.findIndex((l) => l.id === curWorld.levelId) : -1;
+          if (builtInIdx >= 0 && builtInIdx < LEVELS.length - 1) {
+            handleNextLevel();
+          } else if (curWorld?.levelId.startsWith('gen-')) {
+            void handleGenerateLevel({ archetype: 'auto', difficulty: 'tactical' });
+          } else {
+            handleRestartLevel();
+          }
         }
         return;
       }
@@ -429,6 +672,8 @@ export default function App() {
   }, [
     dispatchCurrentKeys,
     focusCanvas,
+    handleGenerateLevel,
+    handleNextLevel,
     handleRestartLevel,
     handleStartPlay,
     handleToggleMute,
@@ -461,7 +706,156 @@ export default function App() {
     <div className="h-screen w-screen overflow-hidden flex flex-col lg:flex-row bg-[#0B1018] text-slate-100">
       {/* Primary Stage Column */}
       <main className="flex-1 flex flex-col min-w-0 min-h-0 relative">
-        {/* Game Viewport */}
+        {/* Clean Unobstructed Stage Header Bar (shown while playing/paused/gameover) */}
+        {shellState !== 'title' && world && (
+          <header className="px-4 py-2 bg-[#0F1623] border-b border-slate-800/90 flex items-center justify-between gap-4 shrink-0">
+            {/* Level Info + Live Telemetry Readout */}
+            <div className="flex items-center gap-4 min-w-0">
+              <div className="min-w-0">
+                <div className="text-xs font-semibold text-slate-100 flex items-center gap-2 truncate">
+                  <span className="truncate">{world.levelName}</span>
+                  {world.levelSubtitle && (
+                    <>
+                      <span className="text-slate-600 hidden lg:inline" aria-hidden="true">·</span>
+                      <span className="text-slate-400 font-normal hidden lg:inline truncate">
+                        {world.levelSubtitle}
+                      </span>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              <div className="hidden sm:flex items-center gap-2.5 pl-4 border-l border-slate-800 tabular-nums shrink-0">
+                <span className="font-mono text-sm font-semibold text-slate-50">
+                  {world.metrics.actorsAtExit}/{world.actors.length}
+                </span>
+                <span className="text-xs text-slate-400">at exit</span>
+                <span className="text-slate-700" aria-hidden="true">·</span>
+                <span className="font-mono text-xs text-sky-300">
+                  {Math.round(
+                    world.solved
+                      ? world.solvedAtSeconds ?? world.metrics.elapsedSeconds
+                      : world.metrics.elapsedSeconds
+                  )}s
+                </span>
+                <span className="text-slate-700" aria-hidden="true">·</span>
+                <span className="font-mono text-xs text-amber-300">
+                  {world.metrics.totalKineticEnergy.toFixed(1)} kJ
+                </span>
+              </div>
+            </div>
+
+            {/* Stage Utility Controls */}
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                tabIndex={-1}
+                onClick={(e) => {
+                  e.currentTarget.blur();
+                  handleToggleEditMode();
+                }}
+                aria-label={
+                  sandboxSelection.tool === 'edit' ? 'Exit level editor' : 'Edit level objects'
+                }
+                title="Select & edit platforms, wires, crosswinds & conveyors"
+                className={`h-8 px-2.5 rounded-md border text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap ${
+                  sandboxSelection.tool === 'edit'
+                    ? 'bg-amber-500/20 border-amber-500/50 text-amber-200'
+                    : 'bg-[#0B1018] border-slate-700/70 text-slate-300 hover:text-white hover:border-slate-600'
+                }`}
+              >
+                <SlidersHorizontal className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Edit</span>
+              </button>
+
+              <button
+                type="button"
+                tabIndex={-1}
+                onClick={(e) => {
+                  e.currentTarget.blur();
+                  setShowAgentPlans((p) => !p);
+                }}
+                aria-label={showAgentPlans ? 'Hide agent plans' : 'Show agent plans'}
+                title={showAgentPlans ? 'Hide Agent Plans' : 'Show Agent Plans'}
+                className={`h-8 px-2.5 rounded-md border text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap ${
+                  showAgentPlans
+                    ? 'bg-sky-500/15 border-sky-500/40 text-sky-200'
+                    : 'bg-[#0B1018] border-slate-700/70 text-slate-300 hover:text-white hover:border-slate-600'
+                }`}
+              >
+                {showAgentPlans ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
+                <span className="hidden sm:inline">Plans</span>
+              </button>
+
+              <button
+                type="button"
+                tabIndex={-1}
+                onClick={(e) => {
+                  e.currentTarget.blur();
+                  handleToggleMute();
+                }}
+                aria-label={muted ? 'Unmute audio [M]' : 'Mute audio [M]'}
+                title="Mute [M]"
+                className="w-8 h-8 rounded-md border border-slate-700/70 bg-[#0B1018] hover:bg-slate-800 text-slate-200 flex items-center justify-center transition-colors cursor-pointer"
+              >
+                {muted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
+              </button>
+
+              <button
+                type="button"
+                tabIndex={-1}
+                onClick={(e) => {
+                  e.currentTarget.blur();
+                  handleRestartLevel();
+                }}
+                aria-label="Restart level [R]"
+                title="Restart [R]"
+                className="w-8 h-8 rounded-md border border-slate-700/70 bg-[#0B1018] hover:bg-slate-800 text-slate-200 flex items-center justify-center transition-colors cursor-pointer"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+              </button>
+
+              <button
+                type="button"
+                tabIndex={-1}
+                onClick={(e) => {
+                  e.currentTarget.blur();
+                  handleTogglePause();
+                }}
+                aria-label={shellState === 'paused' ? 'Resume [P]' : 'Pause [P]'}
+                title="Pause [P]"
+                className="w-8 h-8 rounded-md border border-slate-700/70 bg-[#0B1018] hover:bg-slate-800 text-slate-200 flex items-center justify-center transition-colors cursor-pointer"
+              >
+                {shellState === 'paused' ? (
+                  <Play className="w-3.5 h-3.5" />
+                ) : (
+                  <Pause className="w-3.5 h-3.5" />
+                )}
+              </button>
+
+              <button
+                type="button"
+                tabIndex={-1}
+                onClick={(e) => {
+                  e.currentTarget.blur();
+                  setDockOpen((o) => !o);
+                }}
+                aria-label={dockOpen ? 'Collapse inspector panel' : 'Expand inspector panel'}
+                title={dockOpen ? 'Hide Telemetry Dock' : 'Show Telemetry Dock'}
+                className="hidden lg:inline-flex h-8 px-2.5 rounded-md border border-slate-700/70 bg-[#0B1018] hover:bg-slate-800 text-slate-200 items-center gap-1.5 text-xs font-medium transition-colors cursor-pointer whitespace-nowrap"
+              >
+                {dockOpen ? (
+                  <PanelRightClose className="w-3.5 h-3.5 text-slate-300" />
+                ) : (
+                  <PanelRightOpen className="w-3.5 h-3.5 text-sky-400" />
+                )}
+                <span className="hidden xl:inline">Inspector</span>
+              </button>
+            </div>
+          </header>
+        )}
+
+        {/* Unobstructed Game Viewport */}
         <div className="flex-1 relative min-h-[320px]">
           <GameCanvas
             worldRef={worldRef}
@@ -472,149 +866,12 @@ export default function App() {
             onSelectEntity={handleSelectEntity}
             onCanvasFocus={focusCanvas}
           />
-
-          {/* Compact Corner HUD Overlay (shown while playing/paused/gameover) */}
-          {shellState !== 'title' && world && (
-            <div className="fixed lg:absolute inset-0 pointer-events-none flex flex-col justify-between p-4">
-              <div className="flex items-start justify-between gap-4">
-                {/* Top-Left World-Matched HUD Readout */}
-                <div
-                  className="pointer-events-auto rounded-lg px-3.5 py-2 border border-slate-700/60"
-                  style={{ backgroundColor: 'rgba(11, 16, 24, 0.86)' }}
-                >
-                  <div className="flex items-center gap-3">
-                    <div>
-                      <div className="text-xs font-medium text-slate-300">
-                        {world.levelName}
-                      </div>
-                      <div className="flex items-baseline gap-3 mt-0.5 tabular-nums">
-                        <span className="font-mono text-lg font-semibold text-slate-50">
-                          {world.metrics.actorsAtExit}/{world.actors.length}
-                        </span>
-                        <span className="text-xs text-slate-400">at exit</span>
-                        <span className="text-slate-600" aria-hidden="true">·</span>
-                        <span className="font-mono text-sm text-sky-300">
-                          {Math.round(
-                            world.solved
-                              ? world.solvedAtSeconds ?? world.metrics.elapsedSeconds
-                              : world.metrics.elapsedSeconds
-                          )}s
-                        </span>
-                        <span className="text-slate-600" aria-hidden="true">·</span>
-                        <span className="font-mono text-xs text-amber-300">
-                          {world.metrics.totalKineticEnergy.toFixed(1)} kJ
-                        </span>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Top-Right Compact Utility Controls */}
-                <div className="pointer-events-auto flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    tabIndex={-1}
-                    onClick={(e) => {
-                      e.currentTarget.blur();
-                      handleToggleEditMode();
-                    }}
-                    aria-label={
-                      sandboxSelection.tool === 'edit' ? 'Exit level editor' : 'Edit level objects'
-                    }
-                    title="Select & edit platforms, wires, crosswinds & conveyors"
-                    className={`h-9 px-2.5 rounded-lg border text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap ${
-                      sandboxSelection.tool === 'edit'
-                        ? 'bg-amber-500/20 border-amber-500/50 text-amber-200'
-                        : 'bg-[#0B1018]/85 border-slate-700/70 text-slate-300 hover:text-white'
-                    }`}
-                  >
-                    <SlidersHorizontal className="w-4 h-4" />
-                    <span className="hidden sm:inline">Edit</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    tabIndex={-1}
-                    onClick={(e) => {
-                      e.currentTarget.blur();
-                      setShowAgentPlans((p) => !p);
-                    }}
-                    aria-label={showAgentPlans ? 'Hide agent plans' : 'Show agent plans'}
-                    title={showAgentPlans ? 'Hide Agent Plans' : 'Show Agent Plans'}
-                    className={`h-9 px-2.5 rounded-lg border text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap ${
-                      showAgentPlans
-                        ? 'bg-sky-500/15 border-sky-500/40 text-sky-200'
-                        : 'bg-[#0B1018]/85 border-slate-700/70 text-slate-300 hover:text-white'
-                    }`}
-                  >
-                    {showAgentPlans ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
-                    <span className="hidden sm:inline">Plans</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    tabIndex={-1}
-                    onClick={(e) => {
-                      e.currentTarget.blur();
-                      handleToggleMute();
-                    }}
-                    aria-label={muted ? 'Unmute audio [M]' : 'Mute audio [M]'}
-                    title="Mute [M]"
-                    className="w-9 h-9 rounded-lg border border-slate-700/70 bg-[#0B1018]/85 hover:bg-slate-800 text-slate-200 flex items-center justify-center transition-colors cursor-pointer"
-                  >
-                    {muted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
-                  </button>
-
-                  <button
-                    type="button"
-                    tabIndex={-1}
-                    onClick={(e) => {
-                      e.currentTarget.blur();
-                      handleRestartLevel();
-                    }}
-                    aria-label="Restart level [R]"
-                    title="Restart [R]"
-                    className="w-9 h-9 rounded-lg border border-slate-700/70 bg-[#0B1018]/85 hover:bg-slate-800 text-slate-200 flex items-center justify-center transition-colors cursor-pointer"
-                  >
-                    <RotateCcw className="w-4 h-4" />
-                  </button>
-
-                  <button
-                    type="button"
-                    tabIndex={-1}
-                    onClick={(e) => {
-                      e.currentTarget.blur();
-                      handleTogglePause();
-                    }}
-                    aria-label={shellState === 'paused' ? 'Resume [P]' : 'Pause [P]'}
-                    title="Pause [P]"
-                    className="w-9 h-9 rounded-lg border border-slate-700/70 bg-[#0B1018]/85 hover:bg-slate-800 text-slate-200 flex items-center justify-center transition-colors cursor-pointer"
-                  >
-                    {shellState === 'paused' ? (
-                      <Play className="w-4 h-4" />
-                    ) : (
-                      <Pause className="w-4 h-4" />
-                    )}
-                  </button>
-                </div>
-              </div>
-
-              {/* Quiet bottom-left control / active tool hint */}
-              {(humanActorId || sandboxSelection.tool !== 'pointer') && (
-                <div className="text-[11px] font-mono text-slate-400/90">
-                  {sandboxSelection.tool !== 'pointer'
-                    ? `Sandbox Tool: ${activeToolSpec.label} · ${activeToolSpec.hint} · Esc for Play`
-                    : 'A/D or Arrows Move · W/Space Jump · E Switch · Q Grab/Throw'}
-                </div>
-              )}
-            </div>
-          )}
         </div>
 
         {/* Bottom Engine Control Strip (single row on desktop, hidden on Title Screen) */}
         {shellState !== 'title' && (
-          <div className="px-3 py-2 bg-[#0F1623] border-t border-slate-800/90 flex flex-wrap xl:flex-nowrap items-center justify-between gap-2 shrink-0">
-            {/* Level Selector */}
+          <div className="px-4 py-2 bg-[#0F1623] border-t border-slate-800/90 flex flex-wrap xl:flex-nowrap items-center justify-between gap-2 shrink-0">
+            {/* Level Selector + Quick Procedural Trigger */}
             <div className="flex items-center gap-1 overflow-x-auto">
               {LEVELS.map((lvl) => {
                 const active = world?.levelId === lvl.id;
@@ -634,7 +891,54 @@ export default function App() {
                   </button>
                 );
               })}
+
+              {world && !LEVELS.some((l) => l.id === world.levelId) && (
+                <span
+                  title={world.levelName}
+                  className="px-2 py-1.5 rounded-md text-xs font-semibold bg-emerald-500/20 text-emerald-200 border border-emerald-500/40 whitespace-nowrap shrink-0 max-w-[132px] truncate"
+                >
+                  {world.levelName}
+                </span>
+              )}
+
+              <button
+                type="button"
+                title="Generate a random bot-verified procedural puzzle"
+                onClick={() => {
+                  void handleGenerateLevel({ archetype: 'auto', difficulty: 'tactical' });
+                }}
+                className="inline-flex items-center gap-1 px-2 py-1.5 rounded-md bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/35 text-xs font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0"
+              >
+                <Dices className="w-3.5 h-3.5" />
+                Generate
+              </button>
+
+              <button
+                type="button"
+                title="Open Procedural Generator, Save & Import Library"
+                onClick={() => {
+                  setActiveDockTab('levels');
+                  setDockOpen(true);
+                }}
+                className={`inline-flex items-center gap-1 px-2 py-1.5 rounded-md border text-xs font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                  dockOpen && activeDockTab === 'levels'
+                    ? 'bg-sky-500/20 border-sky-500/40 text-sky-200'
+                    : 'bg-slate-800/70 border-slate-700/70 text-slate-300 hover:bg-slate-700 hover:text-white'
+                }`}
+              >
+                <Layers className="w-3.5 h-3.5" />
+                Levels
+              </button>
             </div>
+
+            {/* Quiet keybind / active tool hint centered on wide screens */}
+            {(humanActorId || sandboxSelection.tool !== 'pointer') && (
+              <div className="hidden 2xl:block text-[11px] font-mono text-slate-400 truncate px-2">
+                {sandboxSelection.tool !== 'pointer'
+                  ? `${activeToolSpec.label} · ${activeToolSpec.hint} · Esc`
+                  : 'A/D Move · W/Space Jump · E Switch · Q Grab/Throw'}
+              </div>
+            )}
 
             {/* Simulation Step, Speed & Export Controls */}
             <div className="flex items-center gap-1.5 shrink-0">
@@ -704,8 +1008,8 @@ export default function App() {
         )}
       </main>
 
-      {/* Real-Time Telemetry & Control Dock (hidden on Title Screen) */}
-      {shellState !== 'title' && (
+      {/* Real-Time Telemetry & Control Dock (hidden on Title Screen, collapsible on lg+) */}
+      {shellState !== 'title' && dockOpen && (
         <TelemetryDock
           world={world}
           connected={connected}
@@ -719,10 +1023,25 @@ export default function App() {
           onUpdatePhysics={handleUpdatePhysics}
           onApplyPhysicsPreset={handleApplyPhysicsPreset}
           onSpawnAgent={() => sendControl('spawn_agent')}
+          onOpenAiAgentModal={() => setAiSpawnOpen(true)}
           onRemoveAgent={(id) => sendControl('remove_agent', id)}
           onToggleHuman={handleToggleHuman}
+          onSendMessage={handleSendSquadMessage}
+          savedLevels={savedLevels}
+          onGenerateLevel={handleGenerateLevel}
+          onSaveCurrentLevel={handleSaveCurrentLevel}
+          onImportLevel={handleImportLevel}
+          onLoadSavedLevel={handleLoadSavedLevel}
+          onDeleteSavedLevel={handleDeleteSavedLevel}
+          onExportCurrentLevel={handleExportCurrentLevel}
         />
       )}
+
+      <SpawnAiAgentModal
+        open={aiSpawnOpen}
+        onClose={() => setAiSpawnOpen(false)}
+        onSpawn={handleSpawnAiAgent}
+      />
 
       {/* Title Screen Overlay */}
       {shellState === 'title' && (
@@ -749,6 +1068,12 @@ export default function App() {
           }}
           onRestart={handleRestartLevel}
           onNextLevel={handleNextLevel}
+          onGenerateNext={() => {
+            void handleGenerateLevel({ archetype: 'auto', difficulty: 'tactical' });
+          }}
+          onSaveLevel={async () => {
+            await handleSaveCurrentLevel(world.levelName);
+          }}
           onExportTrace={handleExportTrace}
           onReturnTitle={handleReturnTitle}
         />
